@@ -939,6 +939,10 @@ def rocm_fp8_paged_mqa_logits(
 
 
 # Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
+# Temporary-memory budget for one query-row chunk in fp8_mqa_logits_torch.
+_MQA_LOGITS_TORCH_TMP_BYTES = 128 * 1024 * 1024
+
+
 def fp8_mqa_logits_torch(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -966,27 +970,32 @@ def fp8_mqa_logits_torch(
     """
     k_fp8, scale = kv
     seq_len_kv = k_fp8.shape[0]
+    num_q, num_heads = q.shape[0], q.shape[1]
     k = k_fp8.to(torch.bfloat16)
     q = q.to(torch.bfloat16)
     device = q.device
+    # ``scale`` is the per-KV-token scale; callers hand it over as ``[N, 1]``
+    # (a ``[N, 4]`` uint8 buffer cast to fp32), so flatten it to ``[N]``.
+    scale = scale.reshape(-1)
 
-    mask_lo = (
-        torch.arange(0, seq_len_kv, device=device)[None, :] >= cu_seqlen_ks[:, None]
-    )
-    mask_hi = (
-        torch.arange(0, seq_len_kv, device=device)[None, :] < cu_seqlen_ke[:, None]
-    )
-    mask = mask_lo & mask_hi
-
-    # ``score`` is [H, M, N]; ``scale`` is the per-KV-token scale, which
-    # vLLM callers hand us as ``[N, 1]`` (a ``[N, 4]`` uint8 buffer cast
-    # to fp32). PyTorch right-aligns dimensions for broadcasting, so a
-    # naked ``score * scale`` would align ``scale``'s leading dim with
-    # ``score``'s M dim and raise a shape mismatch. Flatten to ``[N]`` so
-    # broadcasting lines up with the last dim of ``score``.
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
+    # logits[m, n] = sum_h relu((q[m, h] . k[n]) * scale[n]) * weights[m, h].
+    # Materializing the full [H, M, N] fp32 score needs H x the output's memory,
+    # which runs out of memory on long prefills (e.g. 32 heads x 8K queries x
+    # 32K pooled keys). Accumulate one head at a time over query-row chunks,
+    # keeping temporaries to about _MQA_LOGITS_TORCH_TMP_BYTES.
+    logits = torch.empty((num_q, seq_len_kv), dtype=torch.float32, device=device)
+    rows_per_chunk = max(1, _MQA_LOGITS_TORCH_TMP_BYTES // max(1, 6 * seq_len_kv))
+    cols = torch.arange(0, seq_len_kv, device=device)[None, :]
+    for m0 in range(0, num_q, rows_per_chunk):
+        m1 = min(num_q, m0 + rows_per_chunk)
+        out = logits[m0:m1]
+        out.zero_()
+        for h in range(num_heads):
+            score = (q[m0:m1, h] @ k.T).float()
+            score.mul_(scale).relu_().mul_(weights[m0:m1, h : h + 1])
+            out.add_(score)
+        mask = (cols >= cu_seqlen_ks[m0:m1, None]) & (cols < cu_seqlen_ke[m0:m1, None])
+        out.masked_fill_(~mask, float("-inf"))
 
     return logits
 
