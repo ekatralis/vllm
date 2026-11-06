@@ -1442,6 +1442,7 @@ class RocmPlatform(Platform):
     def get_default_ir_op_priority(
         cls, vllm_config: "VllmConfig"
     ) -> "IrOpPriorityConfig":
+        from vllm._aiter_ops import is_aiter_found_and_supported
         from vllm.config.compilation import CompilationMode, CUDAGraphMode
         from vllm.config.kernel import IrOpPriorityConfig
 
@@ -1459,7 +1460,8 @@ class RocmPlatform(Platform):
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
-            and not on_gfx90a()  # AITER not built for gfx90a, rmsnorm -> SEGV.
+            # AITER is only built for CDNA3+; on gfx908/gfx90a it fails or SEGVs.
+            and is_aiter_found_and_supported()
         ):
             rms_norm = ["aiter"] + default
         else:
