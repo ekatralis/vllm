@@ -84,6 +84,7 @@ from vllm.model_executor.models.utils import (
     get_fused_shared_expert_layers,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
@@ -861,6 +862,20 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
 
+        # Across a PP boundary we send the full residual stream: [T, hidden] or,
+        # with mHC, the hc_mult streams flattened to [T, hc_mult * hidden].
+        self._pp_hc_mult = config.hc_mult if getattr(config, "mhc", False) else 1
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states"], self._pp_hc_mult * config.hidden_size
+            )
+        )
+        if get_pp_group().world_size > 1:
+            assert not self.is_sequence_parallel, (
+                "GLM-5.3-Flash does not support sequence-parallel MoE with "
+                "pipeline parallelism"
+            )
+
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
@@ -908,9 +923,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            if self._pp_hc_mult > 1:
+                hidden_states = hidden_states.view(
+                    hidden_states.shape[0], self._pp_hc_mult, -1
+                )
+            # The sender materialized its deferred hc_post, so the first layer
+            # here starts from the full residual stream with a standalone hc_pre.
+            residual = None
             post = None
             comb = None
 
@@ -932,13 +951,15 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
+            # Materialize this rank's last deferred hc_post (normally fused into
+            # the next layer's hc_pre) and send the full residual stream.
+            # hc_post followed by a standalone hc_pre equals the fused op.
+            if post is not None:
+                hidden_states = self._active_layers[-1].hc_post(
+                    hidden_states, residual, post, comb
+                )
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {"hidden_states": hidden_states.reshape(hidden_states.shape[0], -1)}
             )
 
         if self.end_layer in self.aux_hidden_state_layers:
@@ -1186,6 +1207,9 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
         )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1354,9 +1378,9 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()
