@@ -500,70 +500,83 @@ class ROCMAiterMLASparseMetadataBuilder(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
 
-        # ----- Persistent MLA metadata buffers -----
-        # The aiter sparse decode kernel supports a "persistent" path that
-        # uses precomputed work-splitting metadata for better load balancing
-        # across CUs. Mirrors the approach used in rocm_aiter_mla.py.
-        #
-        # In the sparse case each query token is its own "batch" entry in the
-        # qo_indptr (qo_indptr = [0, 1, 2, ..., num_tokens]) and max_qo_len=1.
-        # We pad get_mla_metadata_info_v1's batch_size to max_num_batched_tokens
-        # so the buffers are large enough for any decode shape we might see.
-        from aiter import dtypes, get_mla_metadata_info_v1
+        from vllm._aiter_ops import is_aiter_found_and_supported
 
-        # Keep metadata sizing consistent with the padded tensor shape passed
-        # to the sparse decode kernel.
-        self._num_attention_heads = AiterMLAHelper.get_actual_mla_num_heads(
-            self.num_heads
-        )
-
-        q_dtype = self.model_dtype
-        kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
-        if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
-            kv_cache_dtype_str = "fp8"
-            q_dtype = dtypes.fp8
+        if not is_aiter_found_and_supported():
+            # Pre-CDNA3 GPUs (e.g. MI100/gfx908) have no AITER. Only the Triton
+            # sparse-MLA path can run there, and it never reads the persistent
+            # metadata, so skip the AITER-sized buffers entirely.
+            self._use_persistent_metadata = False
+            self._num_attention_heads = AiterMLAHelper.get_actual_mla_num_heads(
+                self.num_heads
+            )
+            self._mla_q_dtype = self.model_dtype
+            self._mla_kv_dtype = torch.bfloat16
         else:
-            kv_cache_dtype_str = "bf16"
-        kv_dtype = dtypes.d_dtypes.get(kv_cache_dtype_str, dtypes.bf16)
-        self._mla_q_dtype = q_dtype
-        self._mla_kv_dtype = kv_dtype
+            # ----- Persistent MLA metadata buffers -----
+            # The aiter sparse decode kernel supports a "persistent" path that
+            # uses precomputed work-splitting metadata for better load balancing
+            # across CUs. Mirrors the approach used in rocm_aiter_mla.py.
+            #
+            # In the sparse case each query token is its own "batch" entry in the
+            # qo_indptr (qo_indptr = [0, 1, 2, ..., num_tokens]) and max_qo_len=1.
+            # We pad get_mla_metadata_info_v1's batch_size to max_num_batched_tokens
+            # so the buffers are large enough for any decode shape we might see.
+            from aiter import dtypes, get_mla_metadata_info_v1
 
-        (
-            (work_meta_data_size, work_meta_data_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            max_num_batched_tokens,
-            1,
-            self._num_attention_heads,
-            q_dtype,
-            kv_dtype,
-            is_sparse=True,
-            fast_mode=True,
-        )
-        self._mla_work_meta_data = torch.empty(
-            work_meta_data_size, dtype=work_meta_data_type, device=device
-        )
-        self._mla_work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_type, device=device
-        )
-        self._mla_work_info_set = torch.empty(
-            work_info_set_size, dtype=work_info_set_type, device=device
-        )
-        self._mla_reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_type, device=device
-        )
-        self._mla_reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device=device
-        )
-        self._mla_reduce_partial_map = torch.empty(
-            reduce_partial_map_size,
-            dtype=reduce_partial_map_type,
-            device=device,
-        )
+            # Keep metadata sizing consistent with the padded tensor shape passed
+            # to the sparse decode kernel.
+            self._num_attention_heads = AiterMLAHelper.get_actual_mla_num_heads(
+                self.num_heads
+            )
+
+            q_dtype = self.model_dtype
+            kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+            if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+                kv_cache_dtype_str = "fp8"
+                q_dtype = dtypes.fp8
+            else:
+                kv_cache_dtype_str = "bf16"
+            kv_dtype = dtypes.d_dtypes.get(kv_cache_dtype_str, dtypes.bf16)
+            self._mla_q_dtype = q_dtype
+            self._mla_kv_dtype = kv_dtype
+
+            (
+                (work_meta_data_size, work_meta_data_type),
+                (work_indptr_size, work_indptr_type),
+                (work_info_set_size, work_info_set_type),
+                (reduce_indptr_size, reduce_indptr_type),
+                (reduce_final_map_size, reduce_final_map_type),
+                (reduce_partial_map_size, reduce_partial_map_type),
+            ) = get_mla_metadata_info_v1(
+                max_num_batched_tokens,
+                1,
+                self._num_attention_heads,
+                q_dtype,
+                kv_dtype,
+                is_sparse=True,
+                fast_mode=True,
+            )
+            self._mla_work_meta_data = torch.empty(
+                work_meta_data_size, dtype=work_meta_data_type, device=device
+            )
+            self._mla_work_indptr = torch.empty(
+                work_indptr_size, dtype=work_indptr_type, device=device
+            )
+            self._mla_work_info_set = torch.empty(
+                work_info_set_size, dtype=work_info_set_type, device=device
+            )
+            self._mla_reduce_indptr = torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_type, device=device
+            )
+            self._mla_reduce_final_map = torch.empty(
+                reduce_final_map_size, dtype=reduce_final_map_type, device=device
+            )
+            self._mla_reduce_partial_map = torch.empty(
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_type,
+                device=device,
+            )
 
         self._prev_req_extent: int = 0
         self._prev_indices_extent: int = 0
