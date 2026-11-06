@@ -596,6 +596,8 @@ def _fp8_paged_mqa_logits_decode_kernel(
     N_SPLITS: tl.constexpr,  # KV-tile parallelism factor (grid dim 1)
     NEXT_N: tl.constexpr,  # query positions per batch (1 = decode; >1 = MTP verify)
     CTX_PER_ROW: tl.constexpr,  # ctx_lens is already per-(b, n)
+    PRESHUFFLE: tl.constexpr = False,  # values stored as 16x16 (token, dim) tiles
+    UPCAST_BF16: tl.constexpr = False,  # no fp8 MFMA (e.g. gfx908): dot in bf16
 ):
     # scale_region_off = block_size*D//4 needs D % 4 == 0 (D=128).
     tl.static_assert(HEAD_SIZE % 4 == 0)
@@ -631,7 +633,19 @@ def _fp8_paged_mqa_logits_decode_kernel(
         pos_in_blk = pos - logical_blk * BLOCK_SIZE  # [BLOCK_KV] == pos % BLOCK_SIZE
 
         # block-flat layout: values region, then scales region.
-        val_off = page * stride_kvblk_fp8 + pos_in_blk[:, None] * HEAD_SIZE + d[None, :]
+        if PRESHUFFLE:
+            # Same layout as kpool_compress._cache_k_offset(preshuffle=True).
+            val_off = (
+                page * stride_kvblk_fp8
+                + (pos_in_blk[:, None] // 16) * 16 * HEAD_SIZE
+                + (d[None, :] // 16) * 256
+                + (pos_in_blk[:, None] % 16) * 16
+                + d[None, :] % 16
+            )
+        else:
+            val_off = (
+                page * stride_kvblk_fp8 + pos_in_blk[:, None] * HEAD_SIZE + d[None, :]
+            )
         kv = tl.load(
             kv_val_ptr + val_off, mask=mask_pos[:, None], other=0.0
         )  # [BLOCK_KV, D] fp8
@@ -643,7 +657,11 @@ def _fp8_paged_mqa_logits_decode_kernel(
 
         # fp8 upcasts exactly; bit-identical on gfx942, ~1e-5 rel on gfx950
         # (accum order), top-k unchanged.
-        s = tl.dot(kv, tl.trans(q))  # [BLOCK_KV, H]
+        if UPCAST_BF16:
+            # fp8 e4m3 -> bf16 is exact, so only the accumulation order changes.
+            s = tl.dot(kv.to(tl.bfloat16), tl.trans(q.to(tl.bfloat16)))
+        else:
+            s = tl.dot(kv, tl.trans(q))  # [BLOCK_KV, H]
         s = tl.maximum(s, 0.0)
         s = s * w[None, :]
         s = tl.sum(s, axis=1)  # [BLOCK_KV]
@@ -658,6 +676,7 @@ def rocm_fp8_paged_mqa_logits_triton(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    preshuffle: bool = False,
 ) -> torch.Tensor:
     """Triton paged MQA-logits for decode and MTP; matches the torch ref but
     has no host sync, so it is safe to capture under a full CUDA graph."""
@@ -715,6 +734,8 @@ def rocm_fp8_paged_mqa_logits_triton(
         N_SPLITS=N_SPLITS,
         NEXT_N=next_n,
         CTX_PER_ROW=ctx_per_row,
+        PRESHUFFLE=preshuffle,
+        UPCAST_BF16=not (_ON_GFX942 or _ON_GFX950),
         num_warps=4,
         num_stages=2,
     )
@@ -887,6 +908,23 @@ def rocm_fp8_paged_mqa_logits(
             ChunkQ=heads,
         )
         return out_qk.sum(dim=0)
+    elif block_size % 64 == 0:
+        # No AITER (e.g. MI100/gfx908): use the in-tree Triton kernel. Unlike the
+        # torch reference below, it has no host syncs (so it is CUDA-graph safe)
+        # and it reads the 16x16 SHUFFLE layout the ROCm indexer cache writers
+        # use whenever block_size > 1.
+        logger.info_once(
+            "AITER paged-MQA logits is unavailable; using the Triton kernel."
+        )
+        return rocm_fp8_paged_mqa_logits_triton(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            preshuffle=block_size > 1,
+        )
     else:
         logger.warning_once(
             "AITER paged-MQA logits is unavailable; using the PyTorch "
