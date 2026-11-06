@@ -682,8 +682,10 @@ def rocm_fp8_paged_mqa_logits_triton(
     has no host sync, so it is safe to capture under a full CUDA graph."""
     batch_size, next_n, num_heads, head_size = q_fp8.shape
     block_size = kv_cache_fp8.shape[1]
-    BLOCK_KV = 64
-    assert block_size % BLOCK_KV == 0
+    # KV tile; must divide the page. 64 when possible, else 32/16 (e.g. the
+    # 160-entry kpool pages GLM-5.3-Flash gets from its 640-token blocks).
+    BLOCK_KV = next((b for b in (64, 32, 16) if block_size % b == 0), None)
+    assert BLOCK_KV is not None, f"block_size {block_size} not a multiple of 16"
 
     fp8_dtype = current_platform.fp8_dtype()
     num_blocks = kv_cache_fp8.shape[0]
@@ -908,7 +910,7 @@ def rocm_fp8_paged_mqa_logits(
             ChunkQ=heads,
         )
         return out_qk.sum(dim=0)
-    elif block_size % 64 == 0:
+    elif block_size % 16 == 0:
         # No AITER (e.g. MI100/gfx908): use the in-tree Triton kernel. Unlike the
         # torch reference below, it has no host syncs (so it is CUDA-graph safe)
         # and it reads the 16x16 SHUFFLE layout the ROCm indexer cache writers
