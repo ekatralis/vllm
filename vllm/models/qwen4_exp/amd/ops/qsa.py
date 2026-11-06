@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -14,6 +15,16 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+
+@functools.cache
+def _bf16_small_m_dot_is_broken() -> bool:
+    """Triton miscompiles bf16 tl.dot with M in {4, 8} and K=16 on gfx908 (MI100)."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import _GCN_ARCH
+
+    return "gfx908" in _GCN_ARCH
 
 
 @triton.jit
@@ -878,6 +889,9 @@ def qsa_sparse_paged_attention(
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
+    if not is_fp8 and _bf16_small_m_dot_is_broken():
+        # Padded heads are masked on load and store, so this only costs compute.
+        block_m = max(block_m, 16)
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
