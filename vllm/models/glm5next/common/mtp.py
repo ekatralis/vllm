@@ -340,6 +340,17 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name == "model.embed_tokens.weight" and name in params_dict:
+                # The checkpoint stores the input embedding once, outside the
+                # MTP layer. Load it so the drafter's own copy is valid when it
+                # can't share the target's (under PP the target's last stage
+                # has no embed_tokens).
+                param = params_dict[name]
+                getattr(param, "weight_loader", default_weight_loader)(
+                    param, loaded_weight
+                )
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
