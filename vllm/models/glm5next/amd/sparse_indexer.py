@@ -787,7 +787,10 @@ class SparseAttnIndexerKpool(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if not rocm_aiter_ops.is_enabled():
+        # Only the non-kpool path is AITER-only. The kpool path picks AITER
+        # kernels when available and otherwise falls back to Triton/torch
+        # kernels, which lets it run on pre-CDNA3 GPUs such as MI100 (gfx908).
+        if index_kpool <= 1 and not rocm_aiter_ops.is_enabled():
             raise RuntimeError(
                 "Sparse attention indexer ROCm path is only supported on AITER. "
                 "Please enable aiter with VLLM_ROCM_USE_AITER=1"
