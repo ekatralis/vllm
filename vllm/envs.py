@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
+    VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1446,6 +1447,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Use the Triton PCIe collectives (triton_pcie_collectives.py) for small TP
+    # all-reduces and all-gathers on PCIe-only MI100 (gfx908) nodes. RCCL takes
+    # ~0.3 ms per small collective there; these take ~10-20 us for decode sizes.
+    "VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE": lambda: (
+        os.getenv("VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE", "True").lower() in ("true", "1")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

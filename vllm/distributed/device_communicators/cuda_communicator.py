@@ -24,6 +24,27 @@ from vllm.platforms import current_platform
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
+from .triton_pcie_collectives import PcieCollectives
+
+# Largest message sent to PcieCollectives; above it RCCL is faster
+# (4 MI100s, bf16: 186 vs 380 us at 120 KiB, 420 vs 383 us at 240 KiB).
+_PCIE_COLLECTIVES_MAX_BYTES = 128 * 1024
+
+
+def _use_pcie_collectives(device: torch.device, world_size: int) -> bool:
+    """PCIe-only MI100 (gfx908) node whose GPUs can access each other."""
+    if not (
+        current_platform.is_rocm()
+        and envs.VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE
+        and "gfx908" in torch.cuda.get_device_properties(device).gcnArchName
+    ):
+        return False
+    me = device.index
+    return all(
+        torch.cuda.can_device_access_peer(me, d)
+        for d in range(torch.cuda.device_count())
+        if d != me
+    )
 
 logger = init_logger(__name__)
 
@@ -114,6 +135,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
+        self.pcie_comm: PcieCollectives | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
@@ -201,6 +223,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if (
+            self.world_size > 1
+            and unique_name.split(":")[0] == "tp"
+            and _use_pcie_collectives(self.device, self.world_size)
+        ):
+            # PCIe-only MI100: RCCL takes ~0.3 ms per small collective.
+            self.pcie_comm = PcieCollectives(
+                group=self.cpu_group,
+                device=self.device,
+                max_bytes=_PCIE_COLLECTIVES_MAX_BYTES,
+            )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -357,6 +391,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
+        if self.pcie_comm is not None:
+            enabled_ar_backends.append("PCIE_TRITON")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if (
@@ -382,6 +418,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        pcie_comm = self.pcie_comm
+        if pcie_comm is not None and pcie_comm.should_use(input_):
+            return pcie_comm.all_reduce(input_)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -499,6 +538,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # copy on every step. This is on the hot path for TP forward passes, so
         # keep ROCm on the base-class collective to avoid a decode regression.
         if current_platform.is_rocm():
+            pcie_comm = self.pcie_comm
+            if pcie_comm is not None:
+                inp = input_.contiguous()
+                if pcie_comm.should_use(inp):
+                    out = pcie_comm.all_gather(inp).movedim(0, dim)
+                    input_size = input_.size()
+                    return out.reshape(
+                        input_size[:dim]
+                        + (self.world_size * input_size[dim],)
+                        + input_size[dim + 1 :]
+                    )
             return super().all_gather(input_, dim)
 
         input_size = input_.size()
@@ -831,6 +881,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.pcie_comm is not None:
+            self.pcie_comm.close()
+            self.pcie_comm = None
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None
