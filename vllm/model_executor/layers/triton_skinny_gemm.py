@@ -22,18 +22,66 @@ MAX_ROWS = 32
 
 
 @triton.jit
+def _store_tile(
+    acc,
+    out_ptr,
+    part_ptr,
+    cnt_ptr,
+    pid_m,
+    pid_k,
+    split_k,
+    rows,
+    cols,
+    mask,
+    stride_on,
+    stride_ps,
+    stride_pn,
+):
+    """Store a (rows x cols) fp32 tile. With split-K, each split writes its
+    partial sums and the last split to finish adds them up, so no separate
+    reduction kernel is needed. The per-tile counters are reset afterwards."""
+    if split_k == 1:
+        tl.store(
+            out_ptr + rows[:, None] * stride_on + cols[None, :],
+            acc.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    else:
+        part = part_ptr + rows[:, None] * stride_pn + cols[None, :]
+        tl.store(part + pid_k * stride_ps, acc, mask=mask)
+        tl.debug_barrier()
+        done = tl.atomic_add(cnt_ptr + pid_m, 1, sem="acq_rel", scope="gpu")
+        if done == split_k - 1:
+            total = tl.zeros_like(acc)
+            for s in range(split_k):
+                total += tl.load(
+                    part + s * stride_ps, mask=mask, other=0.0, cache_modifier=".cg"
+                )
+            tl.store(
+                out_ptr + rows[:, None] * stride_on + cols[None, :],
+                total.to(out_ptr.dtype.element_ty),
+                mask=mask,
+            )
+            tl.store(cnt_ptr + pid_m, 0)
+
+
+@triton.jit
 def _skinny_gemm_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
+    part_ptr,
+    cnt_ptr,
     N,
     M,
     K,
     K_PER_SPLIT,
+    SPLIT_K,
     stride_xn,
     stride_wm,
-    stride_os,
     stride_on,
+    stride_ps,
+    stride_pn,
     N_ROWS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -64,10 +112,20 @@ def _skinny_gemm_kernel(
             other=0.0,
         )
         acc += w.to(tl.float32)[None, :, :] * x.to(tl.float32)[:, None, :]
-    tl.store(
-        out_ptr + pid_k * stride_os + rn[:, None] * stride_on + rm[None, :],
-        tl.sum(acc, axis=2).to(out_ptr.dtype.element_ty),
-        mask=n_mask[:, None] & m_mask[None, :],
+    _store_tile(
+        tl.sum(acc, axis=2),
+        out_ptr,
+        part_ptr,
+        cnt_ptr,
+        pid_m,
+        pid_k,
+        SPLIT_K,
+        rn,
+        rm,
+        n_mask[:, None] & m_mask[None, :],
+        stride_on,
+        stride_ps,
+        stride_pn,
     )
 
 
@@ -76,14 +134,18 @@ def _skinny_dot_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
+    part_ptr,
+    cnt_ptr,
     N,
     M,
     K,
     K_PER_SPLIT,
+    SPLIT_K,
     stride_xn,
     stride_wm,
-    stride_os,
     stride_on,
+    stride_ps,
+    stride_pn,
     BLOCK_R: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -112,11 +174,47 @@ def _skinny_dot_kernel(
             other=0.0,
         )
         acc = tl.dot(x, tl.trans(w), acc)
-    tl.store(
-        out_ptr + pid_k * stride_os + rr[:, None] * stride_on + rm[None, :],
-        acc.to(out_ptr.dtype.element_ty),
-        mask=r_mask[:, None] & m_mask[None, :],
+    _store_tile(
+        acc,
+        out_ptr,
+        part_ptr,
+        cnt_ptr,
+        pid_m,
+        pid_k,
+        SPLIT_K,
+        rr,
+        rm,
+        r_mask[:, None] & m_mask[None, :],
+        stride_on,
+        stride_ps,
+        stride_pn,
     )
+
+
+# Split-K tile counters, one set per stream: kernels on one stream run one
+# after another, but the shared experts run on a second stream at the same
+# time. Zero between kernels: the last split of a tile resets its counter, so
+# a CUDA graph can replay the kernels.
+_COUNTERS: dict[tuple[torch.device, int], torch.Tensor] = {}
+_MAX_SPLIT_TILES = 4096
+
+
+def _buffers(
+    x: torch.Tensor, n: int, m: int, split_k: int, m_programs: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Output, fp32 split-K partials and tile counters for one call."""
+    out = torch.empty((n, m), dtype=x.dtype, device=x.device)
+    key = (x.device, torch.cuda.current_stream(x.device).cuda_stream)
+    counters = _COUNTERS.get(key)
+    if counters is None:
+        counters = torch.zeros(_MAX_SPLIT_TILES, dtype=torch.int32, device=x.device)
+        _COUNTERS[key] = counters
+    if split_k == 1:
+        part = torch.empty((1, 1, 1), dtype=torch.float32, device=x.device)
+    else:
+        assert m_programs <= _MAX_SPLIT_TILES
+        part = torch.empty((split_k, n, m), dtype=torch.float32, device=x.device)
+    return out, part, counters
 
 
 def _split_k(m_programs: int, k: int, block_k: int, target: int) -> tuple[int, int]:
@@ -155,32 +253,32 @@ def skinny_gemm(
     block_m, block_k, num_warps, split_k = _launch_config(n, m, k, num_cus)
     k_per_split = triton.cdiv(triton.cdiv(k, split_k), block_k) * block_k
     split_k = triton.cdiv(k, k_per_split)
-    if split_k == 1:
-        out = torch.empty((1, n, m), dtype=x.dtype, device=x.device)
-    else:
-        out = torch.empty((split_k, n, m), dtype=torch.float32, device=x.device)
     grid = (triton.cdiv(m, block_m), split_k)
+    out, part, counters = _buffers(x, n, m, split_k, grid[0])
     _skinny_gemm_kernel[grid](
         x2,
         weight,
         out,
+        part,
+        counters,
         n,
         m,
         k,
         k_per_split,
+        split_k,
         x2.stride(0),
         weight.stride(0),
         out.stride(0),
-        out.stride(1),
+        part.stride(0),
+        part.stride(1),
         N_ROWS=max(triton.next_power_of_2(n), 1),
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         num_warps=num_warps,
     )
-    result = out[0] if split_k == 1 else out.sum(0, dtype=torch.float32).to(x.dtype)
     if bias is not None:
-        result = result + bias
-    return result.reshape(*x.shape[:-1], m)
+        out = out + bias
+    return out.reshape(*x.shape[:-1], m)
 
 
 def _skinny_dot_gemm(
@@ -197,29 +295,29 @@ def _skinny_dot_gemm(
     block_k = 128 if k >= 128 else max(16, triton.next_power_of_2(k))
     m_programs = triton.cdiv(m, block_m)
     split_k, k_per_split = _split_k(m_programs, k, block_k, 2 * num_cus)
-    if split_k == 1:
-        out = torch.empty((1, n, m), dtype=x.dtype, device=x.device)
-    else:
-        out = torch.empty((split_k, n, m), dtype=torch.float32, device=x.device)
+    out, part, counters = _buffers(x, n, m, split_k, m_programs)
     _skinny_dot_kernel[(m_programs, split_k)](
         x2,
         weight,
         out,
+        part,
+        counters,
         n,
         m,
         k,
         k_per_split,
+        split_k,
         x2.stride(0),
         weight.stride(0),
         out.stride(0),
-        out.stride(1),
+        part.stride(0),
+        part.stride(1),
         BLOCK_R=block_r,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         num_warps=2,
         num_stages=1,
     )
-    result = out[0] if split_k == 1 else out.sum(0, dtype=torch.float32).to(x.dtype)
     if bias is not None:
-        result = result + bias
-    return result.reshape(*x.shape[:-1], m)
+        out = out + bias
+    return out.reshape(*x.shape[:-1], m)
