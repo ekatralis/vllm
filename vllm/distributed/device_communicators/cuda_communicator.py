@@ -27,8 +27,8 @@ from .base_device_communicator import DeviceCommunicatorBase
 from .triton_pcie_collectives import PcieCollectives
 
 # Largest message sent to PcieCollectives; above it RCCL is faster
-# (4 MI100s, bf16: 186 vs 380 us at 120 KiB, 420 vs 383 us at 240 KiB).
-_PCIE_COLLECTIVES_MAX_BYTES = 128 * 1024
+# (4 MI100s, bf16: 186 vs 380 us at 120 KiB, 440 vs 383 us at 240 KiB).
+_PCIE_COLLECTIVES_MAX_BYTES = 192 * 1024
 
 
 def _use_pcie_collectives(device: torch.device, world_size: int) -> bool:

@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE: bool = True
+    VLLM_PP_DECODE_BALANCE_MIN_REQS: int = 0
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1447,6 +1448,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # With pipeline parallelism (V2 model runner, async scheduling), spread
+    # decode requests evenly over the in-flight microbatches once at least this
+    # many requests are decoding. 0 disables.
+    "VLLM_PP_DECODE_BALANCE_MIN_REQS": lambda: int(
+        os.getenv("VLLM_PP_DECODE_BALANCE_MIN_REQS", "0")
     ),
     # Use the Triton PCIe collectives (triton_pcie_collectives.py) for small TP
     # all-reduces and all-gathers on PCIe-only MI100 (gfx908) nodes. RCCL takes

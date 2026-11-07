@@ -811,3 +811,30 @@ def test_resumable_request_handoff():
 
     engine._process_oldest_step()
     assert len(request.output_token_ids) == 1
+
+
+def test_pp_decodes_spread_over_microbatches(monkeypatch):
+    """With PP, a request decodes every `pp_size` steps. With
+    VLLM_PP_DECODE_BALANCE_MIN_REQS set, decodes must be spread over the steps
+    instead of all landing in one, which leaves every other step empty."""
+    monkeypatch.setenv("VLLM_PP_DECODE_BALANCE_MIN_REQS", "2")
+    pp_size = 2
+    scheduler = _create_async_pp_scheduler(num_spec=0, pp_size=pp_size, num_blocks=64)
+    requests = create_requests(num_requests=4, num_tokens=8, max_tokens=20)
+    for req in requests:
+        scheduler.add_request(req)
+
+    scheduled = []
+    for _ in range(7):
+        output = scheduler.schedule()
+        scheduled.append(set(output.num_scheduled_tokens))
+        scheduler.update_from_output(output, _make_model_runner_output(output))
+
+    assert scheduled[0] == {r.request_id for r in requests}  # prefill
+    # The step right after the prefill is empty: every request is in flight.
+    decode_steps = [step for step in scheduled[1:] if step]
+    assert len(decode_steps) >= 4
+    assert all(len(step) == 2 for step in decode_steps), decode_steps
+    for step, step_after_next in zip(decode_steps, decode_steps[pp_size:]):
+        assert step == step_after_next
+    assert decode_steps[0].isdisjoint(decode_steps[1])

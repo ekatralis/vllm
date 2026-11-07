@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -812,6 +813,20 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        # PP decode microbatching (V2+PP+async): a request decodes at most every
+        # `decode_stagger` steps. Optionally spread the decodes evenly over the
+        # steps; otherwise all of them can land in one step and the next step
+        # stays empty. Off by default: splitting doubles the per-step overhead
+        # on the last stage, which only pays off for larger batches.
+        decode_stagger = getattr(self, "decode_stagger", 1)
+        max_decode_reqs = len(self.running)
+        balance_min_reqs = envs.VLLM_PP_DECODE_BALANCE_MIN_REQS
+        if self.use_pp and decode_stagger > 1 and balance_min_reqs > 0:
+            num_decodes = sum(1 for r in self.running if not r.is_prefill_chunk)
+            if num_decodes >= balance_min_reqs:
+                max_decode_reqs = cdiv(num_decodes, decode_stagger)
+        num_decode_reqs = 0
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -840,6 +855,12 @@ class Scheduler(SchedulerInterface):
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
                 req_index += 1
                 continue
+
+            if not request.is_prefill_chunk:
+                if num_decode_reqs >= max_decode_reqs:
+                    req_index += 1
+                    continue
+                num_decode_reqs += 1
 
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
