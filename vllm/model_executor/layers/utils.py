@@ -429,6 +429,29 @@ def lmhead_skinny_guard_permits(weight: torch.Tensor, n: int) -> bool:
     return False
 
 
+@functools.cache
+def _on_gfx908() -> bool:
+    from vllm.platforms.rocm import _GCN_ARCH
+
+    return "gfx908" in _GCN_ARCH
+
+
+def _use_triton_skinny_gemm(x: torch.Tensor, weight: torch.Tensor, n: int) -> bool:
+    """Few-row GEMMs on gfx908, where the HIP skinny kernels are not built and
+    BLAS reaches a fraction of HBM bandwidth (see triton_skinny_gemm.py)."""
+    from vllm.model_executor.layers.triton_skinny_gemm import MAX_ROWS
+
+    return (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and 0 < n <= MAX_ROWS
+        and _on_gfx908()
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype == x.dtype
+        and weight.dim() == 2
+        and weight.stride(1) == 1
+    )
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -521,6 +544,11 @@ def rocm_unquantized_gemm_impl(
         x_view = x.reshape(-1, x.size(-1)).contiguous()
         out = ops.LLMM1(weight, x_view, 4)
         return out.reshape(*x.shape[:-1], weight.shape[0])
+
+    if _use_triton_skinny_gemm(x, weight, n):
+        from vllm.model_executor.layers.triton_skinny_gemm import skinny_gemm
+
+        return skinny_gemm(x, weight, bias, cu_count)
 
     # AITER's gfx950 FlyDSL A16W16 kernel addresses C with int32 offsets and
     # reads A/B through 4 GiB buffer descriptors (ROCm/aiter#6853).

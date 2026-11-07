@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+import functools
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -782,6 +784,15 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             ops.moe_sum(input, output)
 
 
+@functools.cache
+def _on_gfx908() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import _GCN_ARCH
+
+    return "gfx908" in _GCN_ARCH
+
+
 class TritonWNA16Experts(TritonExperts):
     @staticmethod
     def _supports_current_device() -> bool:
@@ -827,6 +838,72 @@ class TritonWNA16Experts(TritonExperts):
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
         )
+
+    def _use_decode_gemv(
+        self, hidden_states: torch.Tensor, num_pairs: int, w1: torch.Tensor
+    ) -> bool:
+        """Few routed tokens on gfx908: the tiled kernel is far from HBM bound."""
+        from vllm.model_executor.layers.fused_moe.wna16_gemv import MAX_PAIRS
+
+        return (
+            num_pairs <= MAX_PAIRS
+            and _on_gfx908()
+            and self.quant_config.use_int4_w4a16
+            and self.quant_config.w1_zp is None
+            and self.quant_config.w2_zp is None
+            and self.block_shape is not None
+            and self.block_shape[1] % 128 == 0
+            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+            and w1.dtype == torch.uint8
+        )
+
+    def _apply_decode_gemv(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        expert_map: torch.Tensor | None,
+        intermediate_cache1: torch.Tensor,
+        intermediate_cache2: torch.Tensor,
+        intermediate_cache3: torch.Tensor,
+        N: int,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        from vllm.model_executor.layers.fused_moe.wna16_gemv import moe_wna16_gemv
+
+        assert self.block_shape is not None
+        group_size = self.block_shape[1]
+        top_k = topk_ids.size(1)
+        moe_wna16_gemv(
+            hidden_states,
+            w1,
+            self.w1_scale,
+            intermediate_cache1,
+            topk_ids,
+            None,
+            expert_map,
+            top_k,
+            group_size,
+        )
+        self.activation(
+            activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
+        moe_wna16_gemv(
+            intermediate_cache2,
+            w2,
+            self.w2_scale,
+            intermediate_cache3,
+            topk_ids,
+            None if apply_router_weight_on_input else topk_weights,
+            expert_map,
+            1,
+            group_size,
+        )
+        self.moe_sum(intermediate_cache3, output)
 
     def apply(
         self,
@@ -905,6 +982,24 @@ class TritonWNA16Experts(TritonExperts):
             workspace13, (num_tokens * top_k_num, activation_out_dim)
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+
+        if self._use_decode_gemv(hidden_states, num_tokens * top_k_num, w1):
+            self._apply_decode_gemv(
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                expert_map,
+                intermediate_cache1,
+                intermediate_cache2,
+                intermediate_cache3,
+                N,
+                apply_router_weight_on_input,
+            )
+            return
 
         # Include fused shared-expert rows while preserving EP remapping.
         num_align_experts = w1.shape[0] if expert_map is None else global_num_experts
