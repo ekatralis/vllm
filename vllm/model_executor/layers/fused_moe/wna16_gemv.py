@@ -18,7 +18,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 # Largest number of routed (token, expert) pairs handled here.
-MAX_PAIRS = 64
+MAX_PAIRS = 512
 
 
 @triton.jit
