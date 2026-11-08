@@ -20,11 +20,13 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 class PendingRecv:
     """Per-step slot data for a deferred postprocess on the main stream."""
 
-    event: torch.cuda.Event
+    # RCCL path: received on the broadcast stream, ready at `event`.
+    # Mailbox path: `event` is None and the tensors are read at consume time.
+    event: torch.cuda.Event | None
 
-    sampled_tokens: torch.Tensor  # [num_reqs, sample_len]
-    num_sampled: torch.Tensor  # [num_reqs]
-    num_rejected: torch.Tensor  # [num_reqs]
+    sampled_tokens: torch.Tensor | None  # [num_reqs, sample_len]
+    num_sampled: torch.Tensor | None  # [num_reqs]
+    num_rejected: torch.Tensor | None  # [num_reqs]
     idx_mapping: torch.Tensor  # [num_reqs]
     idx_mapping_np: np.ndarray  # [num_reqs]
     # Records which rows need a deferred postprocess (bool).
@@ -33,6 +35,10 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+    # Mailbox path: message numbers and sizes.
+    seq: int = -1
+    draft_seq: int = -1
+    sample_len: int = 0
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -60,6 +66,12 @@ class PPHandler:
     Uses a dedicated NCCL communicator (sibling of the PP `device_group`)
     for the broadcast so it does not serialize on the wire with the
     inter-stage hidden-state p2p send/recv ops.
+
+    On PCIe-only MI100 (gfx908) the last rank instead writes the outputs
+    straight into the other ranks' memory (`PcieMailbox`), and they are read
+    only when consumed. A waiting RCCL receive on the side stream stalls the
+    main stream there, so the first stage could not start its next step until
+    the last stage had finished: the PP stages ran one after the other.
     """
 
     def __init__(
@@ -90,10 +102,41 @@ class PPHandler:
         # between PP decodes.
         self.req_idx_gen_np = np.zeros(max_num_reqs, dtype=np.int32)
 
-        # Dedicated subgroup for the sampled-token broadcast.
-        self.broadcast_group = get_pp_group().make_sibling_device_group(
-            group_desc="pp_broadcast"
+        self.mailbox = self.draft_mailbox = None
+        self.seq = self.draft_seq = 0
+        pp_group = get_pp_group()
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            _use_pcie_collectives,
         )
+
+        if _use_pcie_collectives(device, pp_group.world_size):
+            from vllm.distributed.device_communicators.triton_pcie_collectives import (
+                PcieMailbox,
+            )
+
+            # The last rank is at most pp_size messages ahead of a reader.
+            num_slots = 4 * pp_group.world_size
+            src = pp_group.world_size - 1
+            self.mailbox = PcieMailbox(
+                pp_group.cpu_group,
+                device,
+                src,
+                max_words=max_num_reqs * (2 * self.max_sample_len + 2),
+                num_slots=num_slots,
+            )
+            if num_speculative_steps > 0:
+                self.draft_mailbox = PcieMailbox(
+                    pp_group.cpu_group,
+                    device,
+                    src,
+                    max_words=max_num_reqs * 2 * num_speculative_steps,
+                    num_slots=num_slots,
+                )
+        else:
+            # Dedicated subgroup for the sampled-token broadcast.
+            self.broadcast_group = pp_group.make_sibling_device_group(
+                group_desc="pp_broadcast"
+            )
         # Whether sampled tokens were broadcast this step.
         self.sampled_tokens_broadcast = False
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
@@ -139,6 +182,8 @@ class PPHandler:
         self.queue.append(None)
         if slot is None:
             return None
+        if slot.event is None:
+            return self._read_mailbox(slot)
 
         # Skip requests which did not need sampled output and/or those already
         # finished. The post_update kernel skips the -1 entries.
@@ -162,9 +207,50 @@ class PPHandler:
             draft_tokens=slot.draft_tokens,
         )
 
+    def _read_mailbox(self, slot: PendingRecv) -> dict[str, torch.Tensor | None] | None:
+        freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
+        exclude_mask = freed | ~slot.need_sampled_mask
+        if exclude_mask.all():
+            # Nothing to update; the message need not be read.
+            return None
+        idx_mapping = slot.idx_mapping
+        if exclude_mask.any():
+            idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
+            idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
+
+        assert self.mailbox is not None
+        n, width = len(slot.idx_mapping_np), slot.sample_len
+        words = torch.empty(n * (2 * width + 2), dtype=torch.int32, device=self.device)
+        self.mailbox.recv(words, slot.seq)
+        draft_tokens = None
+        if slot.draft_seq >= 0:
+            assert self.draft_mailbox is not None
+            draft_tokens = torch.empty(
+                n, self.num_speculative_steps, dtype=torch.int64, device=self.device
+            )
+            self.draft_mailbox.recv(
+                draft_tokens.view(-1).view(torch.int32), slot.draft_seq
+            )
+        return dict(
+            sampled_tokens=words[: 2 * n * width].view(torch.int64).view(n, width),
+            num_sampled=words[2 * n * width : 2 * n * width + n],
+            num_rejected=words[2 * n * width + n :],
+            idx_mapping=idx_mapping,
+            draft_tokens=draft_tokens,
+        )
+
     def broadcast_drafts(self, draft_tokens: torch.Tensor) -> None:
         """Broadcast draft proposals so non-last ranks can embed real token ids."""
         assert self.is_last_rank
+        if self.mailbox is not None:
+            if not self.sampled_tokens_broadcast:
+                return
+            assert self.draft_mailbox is not None
+            assert draft_tokens.dtype == torch.int64
+            words = draft_tokens.contiguous().view(-1).view(torch.int32)
+            self.draft_mailbox.send(words, self.draft_seq)
+            self.draft_seq += 1
+            return
         if self.sampled_tokens_broadcast:
             with torch.cuda.stream(self.broadcast_stream):
                 self.broadcast_stream.wait_stream(self.main_stream)
@@ -188,6 +274,24 @@ class PPHandler:
         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
 
         num_reqs = input_batch.num_reqs
+        if self.mailbox is not None:
+            # Read when consumed (`get_prev_sampled_outputs`).
+            self.queue[-1] = PendingRecv(
+                None,
+                None,
+                None,
+                None,
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+                need_sampled_mask,
+                gen_at_receive_np,
+                seq=self.seq,
+                draft_seq=self.draft_seq if recv_drafts else -1,
+                sample_len=self._sample_len(input_batch),
+            )
+            self.seq += 1
+            self.draft_seq += int(recv_drafts)
+            return bool(need_sampled_mask.all())
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             sample_len = self._sample_len(input_batch)
@@ -245,6 +349,19 @@ class PPHandler:
 
         assert sampled_token_ids.dtype == torch.int64
         self.sampled_tokens_broadcast = True
+
+        if self.mailbox is not None:
+            assert sampled_token_ids.shape[-1] == self._sample_len(input_batch)
+            words = torch.cat(
+                (
+                    sampled_token_ids.contiguous().view(-1).view(torch.int32),
+                    num_sampled.to(torch.int32),
+                    num_rejected.to(torch.int32),
+                )
+            )
+            self.mailbox.send(words, self.seq)
+            self.seq += 1
+            return
 
         if current_platform.is_xpu():
             self.main_stream.synchronize()
