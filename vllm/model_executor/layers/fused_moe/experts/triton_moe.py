@@ -7,6 +7,7 @@ import functools
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -847,6 +848,7 @@ class TritonWNA16Experts(TritonExperts):
 
         return (
             num_pairs <= MAX_PAIRS
+            and envs.VLLM_ROCM_MOE_DECODE_GEMV
             and _on_gfx908()
             and self.quant_config.use_int4_w4a16
             and self.quant_config.w1_zp is None

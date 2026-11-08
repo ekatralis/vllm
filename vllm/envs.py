@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE: bool = True
+    VLLM_ROCM_MOE_DECODE_GEMV: bool = True
     VLLM_PP_DECODE_BALANCE_MIN_REQS: int = 0
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1460,6 +1461,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ~0.3 ms per small collective there; these take ~10-20 us for decode sizes.
     "VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE": lambda: (
         os.getenv("VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE", "True").lower() in ("true", "1")
+    ),
+    # Use the int4 MoE decode GEMV (fused_moe/wna16_gemv.py) for few routed tokens
+    # on gfx908 (MI100) instead of the tiled WNA16 MoE kernel.
+    "VLLM_ROCM_MOE_DECODE_GEMV": lambda: (
+        os.getenv("VLLM_ROCM_MOE_DECODE_GEMV", "True").lower() in ("true", "1")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
