@@ -26,9 +26,11 @@ from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 from .triton_pcie_collectives import PcieCollectives
 
-# Largest message sent to PcieCollectives; above it RCCL is faster
-# (4 MI100s, bf16: 186 vs 380 us at 120 KiB, 440 vs 383 us at 240 KiB).
-_PCIE_COLLECTIVES_MAX_BYTES = 192 * 1024
+# Largest messages sent to PcieCollectives; above them RCCL is faster
+# (4 MI100s, bf16). All-reduce: two-shot 182 us vs RCCL ~380 us at 240 KiB.
+# All-gather: 186 vs 380 us at 120 KiB, 440 vs 383 us at 240 KiB.
+_PCIE_COLLECTIVES_MAX_BYTES = 384 * 1024
+_PCIE_ALL_GATHER_MAX_BYTES = 192 * 1024
 
 
 def _use_pcie_collectives(device: torch.device, world_size: int) -> bool:
@@ -541,7 +543,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             pcie_comm = self.pcie_comm
             if pcie_comm is not None:
                 inp = input_.contiguous()
-                if pcie_comm.should_use(inp):
+                if pcie_comm.should_use(inp, _PCIE_ALL_GATHER_MAX_BYTES):
                     out = pcie_comm.all_gather(inp).movedim(0, dim)
                     input_size = input_.size()
                     return out.reshape(

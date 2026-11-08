@@ -18,7 +18,7 @@ from vllm.triton_utils import tl, triton
 # Rows handled by the multiply-add kernel; up to MAX_ROWS use the tl.dot kernel,
 # whose 16/32-row tiles use the 16x16x8 bf16 MFMA (correct on gfx908).
 MAX_FMA_ROWS = 1
-MAX_ROWS = 32
+MAX_ROWS = 48
 
 
 @triton.jit
@@ -290,7 +290,7 @@ def _skinny_dot_gemm(
 ) -> torch.Tensor:
     n, k = x2.shape
     m = weight.shape[0]
-    block_r = 16 if n <= 16 else 32
+    block_r = 16 if n <= 16 else (32 if n <= 32 else 64)
     block_m = 32 if n <= 16 else 16
     block_k = 128 if k >= 128 else max(16, triton.next_power_of_2(k))
     m_programs = triton.cdiv(m, block_m)
