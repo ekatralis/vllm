@@ -25,7 +25,7 @@ def _check(out, x, w):
     assert err < 1e-2, err
 
 
-@pytest.mark.parametrize("n", [1, 3, 12, 24])
+@pytest.mark.parametrize("n", [1, 3, 12, 24, 36, 48])
 @pytest.mark.parametrize("k,m", SHAPES)
 def test_skinny_gemm(n, k, m):
     torch.manual_seed(0)
