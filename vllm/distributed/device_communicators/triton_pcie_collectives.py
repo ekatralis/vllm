@@ -40,6 +40,9 @@ logger = init_logger(__name__)
 _NUM_PROGRAMS = 64
 _BLOCK = 512
 _NUM_WARPS = 4
+# All-reduces from this size use the two-shot kernel. 4 MI100s, bf16 x 2560:
+# 1/3/6/24/48 rows one-shot 9/17/42/192/466 us, two-shot 17/18/21/91/183 us.
+_TWO_SHOT_MIN_BYTES = 20 * 1024
 
 
 @triton.jit
@@ -128,6 +131,94 @@ def _pcie_ll_kernel(
     tl.store(epoch_ptr + p, e)
 
 
+@triton.jit
+def _wait_ll(src, idx_c, e):
+    v = tl.load(src + idx_c, cache_modifier=".cv")
+    while tl.min(((v >> 32).to(tl.int32) == e).to(tl.int32), axis=0) == 0:
+        v = tl.load(src + idx_c, cache_modifier=".cv")
+    return v.to(tl.int32)
+
+
+@triton.jit
+def _pcie_ll_two_shot_kernel(
+    inp_ptr,  # int32 words
+    out_ptr,  # int32 words
+    buf_ptrs,  # int64[W]: each rank's receive buffer
+    epoch_ptr,  # int32[NUM_PROGRAMS], this rank only
+    n,
+    rank,
+    HALF_WORDS,
+    W: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    DTYPE: tl.constexpr,
+):
+    """All-reduce as reduce-scatter + all-gather, half the PCIe traffic of
+    _pcie_ll_kernel for 4 GPUs. The input is split into W chunks; rank j
+    reduces chunk j and sends the result to everyone. Program p handles the
+    same slice of a chunk in both phases, so no sync between programs."""
+    p = tl.program_id(0)
+    e = tl.load(epoch_ptr + p) + 1
+    c = tl.cdiv(n, W)  # chunk words
+    half = (e % 2).to(tl.int64) * HALF_WORDS
+    rs_off = half  # phase 1 area: [W senders, c]
+    ag_off = half + W * c  # phase 2 area: [W chunks, c]
+    chunk = tl.cdiv(tl.cdiv(c, NUM_PROGRAMS), BLOCK) * BLOCK
+    start = p * chunk
+    end = tl.minimum(start + chunk, c)
+    offs = tl.arange(0, BLOCK)
+    tag = e.to(tl.int64) << 32
+    my_buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64))
+
+    # 1. Send slice of chunk j to rank j (padding past n is sent as zeros,
+    #    so the receivers' wait covers whole slices).
+    for k in range(start, end, BLOCK):
+        idx = k + offs
+        m = idx < end
+        for j in tl.static_range(W):
+            g = j * c + idx
+            w = tl.load(inp_ptr + g, mask=m & (g < n), other=0)
+            dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
+            pair = tag | (w.to(tl.int64) & 0xFFFFFFFF)
+            tl.store(dst + rs_off + rank * c + idx, pair, mask=m)
+
+    # 2. Reduce chunk `rank` in rank order and send it to every rank.
+    for k in range(start, end, BLOCK):
+        idx = k + offs
+        m = idx < end
+        idx_c = tl.minimum(idx, end - 1)
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        acc_hi = tl.zeros((BLOCK,), dtype=tl.float32)
+        for j in tl.static_range(W):
+            w = _wait_ll(my_buf + rs_off + j * c, idx_c, e)
+            if DTYPE == tl.float32:
+                acc += w.to(tl.float32, bitcast=True)
+            else:
+                lo, hi = _unpack16(w, DTYPE)
+                acc += lo
+                acc_hi += hi
+        if DTYPE == tl.float32:
+            res = acc.to(tl.int32, bitcast=True)
+        else:
+            res = _pack16(acc, acc_hi, DTYPE)
+        pair = tag | (res.to(tl.int64) & 0xFFFFFFFF)
+        for j in tl.static_range(W):
+            dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
+            tl.store(dst + ag_off + rank * c + idx, pair, mask=m)
+
+    # 3. Collect every reduced chunk.
+    for k in range(start, end, BLOCK):
+        idx = k + offs
+        m = idx < end
+        idx_c = tl.minimum(idx, end - 1)
+        for j in tl.static_range(W):
+            w = _wait_ll(my_buf + ag_off + j * c, idx_c, e)
+            g = j * c + idx
+            tl.store(out_ptr + g, w, mask=m & (g < n))
+
+    tl.store(epoch_ptr + p, e)
+
+
 _TL_DTYPES = {
     torch.float32: tl.float32,
     torch.float16: tl.float16,
@@ -161,12 +252,12 @@ class PcieCollectives:
             )
             self._epoch = torch.zeros(_NUM_PROGRAMS, dtype=torch.int32, device=device)
 
-    def should_use(self, inp: torch.Tensor) -> bool:
+    def should_use(self, inp: torch.Tensor, max_bytes: int | None = None) -> bool:
         nbytes = inp.numel() * inp.element_size()
         return (
             inp.dtype in _TL_DTYPES
             and inp.is_contiguous()
-            and 0 < nbytes <= self.max_bytes
+            and 0 < nbytes <= min(self.max_bytes, max_bytes or self.max_bytes)
             and nbytes % 4 == 0
         )
 
@@ -190,7 +281,25 @@ class PcieCollectives:
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(inp)
-        self._launch(inp, out, gather=False)
+        nbytes = inp.numel() * inp.element_size()
+        if self.world_size > 2 and nbytes >= _TWO_SHOT_MIN_BYTES:
+            words = inp.view(-1).view(torch.int32)
+            _pcie_ll_two_shot_kernel[(_NUM_PROGRAMS,)](
+                words,
+                out.view(-1).view(torch.int32),
+                self._buf_ptr_t,
+                self._epoch,
+                words.numel(),
+                self.rank,
+                self.world_size * self._slot_words,
+                W=self.world_size,
+                NUM_PROGRAMS=_NUM_PROGRAMS,
+                BLOCK=_BLOCK,
+                DTYPE=_TL_DTYPES[inp.dtype],
+                num_warps=_NUM_WARPS,
+            )
+        else:
+            self._launch(inp, out, gather=False)
         return out
 
     def all_gather(self, inp: torch.Tensor) -> torch.Tensor:
@@ -198,6 +307,128 @@ class PcieCollectives:
         out = inp.new_empty((self.world_size,) + inp.shape)
         self._launch(inp, out, gather=True)
         return out
+
+    def close(self) -> None:
+        if getattr(self, "_buf_ptrs", None) is not None:
+            ops.free_shared_buffer(self._buf_ptrs[self.rank])
+            self._buf_ptrs = None
+
+
+@triton.jit(do_not_specialize=["n", "seq"])
+def _mailbox_send_kernel(
+    inp_ptr,  # int32 words
+    buf_ptrs,  # int64[W]: each rank's mailbox, int64[NUM_SLOTS, SLOT_WORDS]
+    n,
+    seq,
+    src,
+    SLOT_WORDS,
+    NUM_SLOTS: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = idx < n
+    tag = (seq + 1).to(tl.int64) << 32
+    pair = tag | (tl.load(inp_ptr + idx, mask=m).to(tl.int64) & 0xFFFFFFFF)
+    slot = (seq % NUM_SLOTS).to(tl.int64) * SLOT_WORDS
+    for j in tl.static_range(W):
+        if j != src:
+            dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
+            tl.store(dst + slot + idx, pair, mask=m)
+
+
+@triton.jit(do_not_specialize=["n", "seq"])
+def _mailbox_recv_kernel(
+    out_ptr,  # int32 words
+    buf_ptrs,  # int64[W]: each rank's mailbox, int64[NUM_SLOTS, SLOT_WORDS]
+    n,
+    seq,
+    rank,
+    SLOT_WORDS,
+    NUM_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = idx < n
+    # Clamped instead of masked inside the wait loop (see _pcie_ll_kernel).
+    idx_c = tl.minimum(idx, n - 1)
+    buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64))
+    src = buf + (seq % NUM_SLOTS).to(tl.int64) * SLOT_WORDS + idx_c
+    v = tl.load(src, cache_modifier=".cv")
+    while tl.min(((v >> 32).to(tl.int32) == seq + 1).to(tl.int32), axis=0) == 0:
+        v = tl.load(src, cache_modifier=".cv")
+    tl.store(out_ptr + idx, v.to(tl.int32), mask=m)
+
+
+class PcieMailbox:
+    """One-way channel for small messages from one rank of `group` to all the
+    others, by direct writes into the receivers' memory (same tagged-word
+    scheme as above). Sending never waits for the receivers, and a receiver
+    only waits if it reads a message before it has arrived. Message `seq` goes
+    to slot `seq % num_slots`, so the sender must stay less than `num_slots`
+    messages ahead of every receiver. Not for use inside CUDA graphs."""
+
+    _BLOCK = 256
+
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device,
+        src: int,
+        max_words: int,
+        num_slots: int,
+    ):
+        """group: a CPU (gloo) group; src: the sender's rank in it."""
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        self.rank = dist.get_rank(group)
+        self.world_size = dist.get_world_size(group)
+        self.src = src
+        self.max_words = max_words
+        self.num_slots = num_slots
+        with torch.cuda.device(device):
+            self._buf_ptrs = CustomAllreduce.create_shared_buffer(
+                num_slots * max_words * 8, group=group
+            )
+            self._buf_ptr_t = torch.tensor(
+                self._buf_ptrs, dtype=torch.int64, device=device
+            )
+
+    def send(self, words: torch.Tensor, seq: int) -> None:
+        assert self.rank == self.src and words.dtype == torch.int32
+        n = words.numel()
+        assert 0 < n <= self.max_words
+        _mailbox_send_kernel[(triton.cdiv(n, self._BLOCK),)](
+            words.contiguous().view(-1),
+            self._buf_ptr_t,
+            n,
+            seq,
+            self.src,
+            self.max_words,
+            NUM_SLOTS=self.num_slots,
+            W=self.world_size,
+            BLOCK=self._BLOCK,
+            num_warps=4,
+        )
+
+    def recv(self, out: torch.Tensor, seq: int) -> None:
+        assert self.rank != self.src and out.dtype == torch.int32
+        assert out.is_contiguous()
+        n = out.numel()
+        assert 0 < n <= self.max_words
+        _mailbox_recv_kernel[(triton.cdiv(n, self._BLOCK),)](
+            out.view(-1),
+            self._buf_ptr_t,
+            n,
+            seq,
+            self.rank,
+            self.max_words,
+            NUM_SLOTS=self.num_slots,
+            BLOCK=self._BLOCK,
+            num_warps=4,
+        )
 
     def close(self) -> None:
         if getattr(self, "_buf_ptrs", None) is not None:
