@@ -927,6 +927,10 @@ class CompilationConfig:
         "vllm::zaya_cca",
         # Qwen4Exp's AMD backend still uses these splitting ops.
         "vllm::qwen4_exp_ple_short_conv",
+        # Launched with the request count of the current batch (a host int);
+        # inside a piecewise CUDA graph it would replay the capture-time count
+        # and read stale request boundaries.
+        "vllm::qwen4_exp_amd_ple_ngram_ids",
         "vllm::qwen4_exp_qsa_with_output",
         # The fused prepare calls this op instead of the one above.
         "vllm::qwen4_exp_qsa_prepare_with_output",
