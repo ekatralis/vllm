@@ -1292,6 +1292,38 @@ class SpeculativeConfig:
         return target_hf_overrides(hf_config)
 
     @staticmethod
+    def apply_dict_hf_overrides(
+        overrides: dict[str, Any], hf_config: PreTrainedConfig
+    ) -> PreTrainedConfig:
+        """Apply a target's dict ``hf_overrides`` to a draft config.
+
+        Same merge as ``ModelConfig`` applies to the target: nested configs
+        and dict-valued attributes are updated key by key, other values are
+        replaced. Used when the draft loads the target's own checkpoint (e.g.
+        MTP), where target patches such as ``rope_parameters`` (YaRN) must
+        apply to the draft as well.
+        """
+
+        def update(target: Any, updates: dict[str, Any]) -> None:
+            for key, value in updates.items():
+                nested = (
+                    target.get(key)
+                    if isinstance(target, dict)
+                    else getattr(target, key, None)
+                )
+                if isinstance(value, dict) and (
+                    isinstance(nested, dict) or hasattr(nested, "__dict__")
+                ):
+                    update(nested, value)
+                elif isinstance(target, dict):
+                    target[key] = value
+                else:
+                    setattr(target, key, value)
+
+        update(hf_config, overrides)
+        return hf_config
+
+    @staticmethod
     def compose_draft_hf_overrides(
         target_hf_overrides: HfOverrides | None,
         transformers_mtp_overrides: dict[str, Any] | None = None,

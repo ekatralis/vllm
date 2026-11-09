@@ -14,6 +14,7 @@ Parts only needed by the V1 model runner are marked "V1 model runner only", and
 will be removed with it.
 """
 
+import functools
 from typing import TYPE_CHECKING, Any, ClassVar, final, get_args
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -186,9 +187,20 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
             return
 
         target = spec.target_model_config
-        # Callable target hf_overrides also apply to the draft; dict ones don't.
+        # Callable target hf_overrides also apply to the draft; dict ones only
+        # when the draft loads the target's own checkpoint (e.g. MTP), where
+        # patches such as YaRN rope_parameters describe the draft too.
+        target_hf_overrides = target.hf_overrides
+        if (
+            target_hf_overrides
+            and not callable(target_hf_overrides)
+            and spec.model == target.model
+        ):
+            target_hf_overrides = functools.partial(
+                SpeculativeConfig.apply_dict_hf_overrides, target_hf_overrides
+            )
         draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-            target.hf_overrides, cls.transformers_backend_hf_overrides(spec)
+            target_hf_overrides, cls.transformers_backend_hf_overrides(spec)
         )
         spec.draft_model_config = ModelConfig(
             model=spec.model,
