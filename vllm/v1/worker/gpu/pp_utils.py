@@ -210,11 +210,8 @@ class PPHandler:
     def _read_mailbox(self, slot: PendingRecv) -> dict[str, torch.Tensor | None] | None:
         freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
         exclude_mask = freed | ~slot.need_sampled_mask
-        if exclude_mask.all():
-            # Nothing to update; the message need not be read.
-            return None
         idx_mapping = slot.idx_mapping
-        if exclude_mask.any():
+        if exclude_mask.any() and not exclude_mask.all():
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
@@ -231,6 +228,10 @@ class PPHandler:
             self.draft_mailbox.recv(
                 draft_tokens.view(-1).view(torch.int32), slot.draft_seq
             )
+        # Receiving also invalidates the mailbox words before their tags can
+        # repeat. Drain sampled and draft messages even for cancelled requests.
+        if exclude_mask.all():
+            return None
         return dict(
             sampled_tokens=words[: 2 * n * width].view(torch.int64).view(n, width),
             num_sampled=words[2 * n * width : 2 * n * width + n],

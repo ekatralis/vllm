@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from vllm.compilation.collective_cudagraph import create_cudagraph
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cudagraph_pool import capture_pool
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
@@ -282,7 +283,7 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
+            cudagraph = create_cudagraph()
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:

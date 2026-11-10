@@ -30,6 +30,12 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm import _custom_ops as ops
+from vllm.compilation.collective_counter import CollectiveCounter
+from vllm.compilation.collective_cudagraph import (
+    can_capture_collectives,
+    enable_collective_graphs,
+    record_collective,
+)
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
@@ -77,8 +83,8 @@ def _pcie_ll_kernel(
 ):
     p = tl.program_id(0)
     e = tl.load(epoch_ptr + p) + 1
-    # `& 1`, not `% 2`: the int32 call counter wraps to negative values after 2^31 calls,
-    # where `e % 2` is -1 and would address memory before the buffer.
+    # Keep half selection nonnegative even if an int32 counter wraps.
+    # A signed remainder could otherwise address memory before the buffer.
     half = (e & 1).to(tl.int64) * (W * SLOT_WORDS)
     chunk = tl.cdiv(tl.cdiv(n, NUM_PROGRAMS), BLOCK) * BLOCK
     start = p * chunk
@@ -117,14 +123,14 @@ def _pcie_ll_kernel(
             w = v.to(tl.int32)  # low 32 bits
             if GATHER:
                 tl.store(out_ptr + j * n + idx, w, mask=m)
-            elif DTYPE == tl.float32:
+            elif tl.float32 == DTYPE:
                 acc += w.to(tl.float32, bitcast=True)
             else:
                 lo, hi = _unpack16(w, DTYPE)
                 acc += lo
                 acc_hi += hi
         if not GATHER:
-            if DTYPE == tl.float32:
+            if tl.float32 == DTYPE:
                 res = acc.to(tl.int32, bitcast=True)
             else:
                 res = _pack16(acc, acc_hi, DTYPE)
@@ -193,13 +199,13 @@ def _pcie_ll_two_shot_kernel(
         acc_hi = tl.zeros((BLOCK,), dtype=tl.float32)
         for j in tl.static_range(W):
             w = _wait_ll(my_buf + rs_off + j * c, idx_c, e)
-            if DTYPE == tl.float32:
+            if tl.float32 == DTYPE:
                 acc += w.to(tl.float32, bitcast=True)
             else:
                 lo, hi = _unpack16(w, DTYPE)
                 acc += lo
                 acc_hi += hi
-        if DTYPE == tl.float32:
+        if tl.float32 == DTYPE:
             res = acc.to(tl.int32, bitcast=True)
         else:
             res = _pack16(acc, acc_hi, DTYPE)
@@ -228,31 +234,69 @@ _TL_DTYPES = {
 }
 
 
+@triton.jit
+def _clear_pcie_buffer(buf_ptrs, rank, n, BLOCK: tl.constexpr):
+    buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64))
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(buf + idx, 0, mask=idx < n)
+
+
 class PcieCollectives:
     """All-reduce and all-gather of small tensors over PCIe peer memory."""
 
-    def __init__(self, group: ProcessGroup, device: torch.device, max_bytes: int):
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device,
+        max_bytes: int,
+        *,
+        max_epoch: int = 2**31 - 1,
+    ):
         """group: a CPU (gloo) group whose ranks are this node's GPUs."""
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
 
+        if device.index is None:
+            device = torch.device(device.type, torch.accelerator.current_device_index())
         self.group = group
         self.device = device
         self.rank = dist.get_rank(group)
         self.world_size = dist.get_world_size(group)
         self.max_bytes = max_bytes
         self._slot_words = max_bytes // 4
-        with torch.cuda.device(device):
+        if not 1 <= max_epoch <= 2**31 - 1:
+            raise ValueError("max_epoch must fit in a positive int32")
+        self._counter = CollectiveCounter(self._reset, limit=max_epoch)
+        with torch.accelerator.device_index(device.index):
             # Receive buffer: 2 halves x one slot per sender, 8 bytes per word.
             # Zero-filled; call numbers start at 1.
-            self._buf_ptrs = CustomAllreduce.create_shared_buffer(
+            self._buf_ptrs: list[int] | None = CustomAllreduce.create_shared_buffer(
                 2 * self.world_size * self._slot_words * 8, group=group
             )
             self._buf_ptr_t = torch.tensor(
                 self._buf_ptrs, dtype=torch.int64, device=device
             )
             self._epoch = torch.zeros(_NUM_PROGRAMS, dtype=torch.int32, device=device)
+            # Compile the maintenance kernel before serving or graph capture.
+            # The barriers also keep peers from writing during initialization.
+            self._reset()
+        enable_collective_graphs(device)
+
+    def _reset(self) -> None:
+        # Calls and graph replays must be stream-ordered, as required by the
+        # double-buffer protocol. Do not synchronize unrelated PP streams:
+        # they can be waiting for work that this forward has yet to produce.
+        stream = torch.cuda.current_stream(self.device)
+        stream.synchronize()
+        dist.barrier(group=self.group)
+        n = 2 * self.world_size * self._slot_words
+        _clear_pcie_buffer[(triton.cdiv(n, 1024),)](
+            self._buf_ptr_t, self.rank, n, BLOCK=1024
+        )
+        self._epoch.zero_()
+        stream.synchronize()
+        dist.barrier(group=self.group)
 
     def should_use(self, inp: torch.Tensor, max_bytes: int | None = None) -> bool:
         nbytes = inp.numel() * inp.element_size()
@@ -261,6 +305,12 @@ class PcieCollectives:
             and inp.is_contiguous()
             and 0 < nbytes <= min(self.max_bytes, max_bytes or self.max_bytes)
             and nbytes % 4 == 0
+            # External/raw torch graphs cannot account for replays. Let the
+            # communicator use RCCL for those captures instead.
+            and (
+                not torch.cuda.is_current_stream_capturing()
+                or can_capture_collectives(self.device)
+            )
         )
 
     def _launch(self, inp: torch.Tensor, out: torch.Tensor, gather: bool) -> None:
@@ -282,6 +332,7 @@ class PcieCollectives:
         )
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        record_collective(self._counter, self.device)
         out = torch.empty_like(inp)
         nbytes = inp.numel() * inp.element_size()
         if self.world_size > 2 and nbytes >= _TWO_SHOT_MIN_BYTES:
@@ -306,13 +357,15 @@ class PcieCollectives:
 
     def all_gather(self, inp: torch.Tensor) -> torch.Tensor:
         """Returns [world_size, *inp.shape], rank-major."""
+        record_collective(self._counter, self.device)
         out = inp.new_empty((self.world_size,) + inp.shape)
         self._launch(inp, out, gather=True)
         return out
 
     def close(self) -> None:
-        if getattr(self, "_buf_ptrs", None) is not None:
-            ops.free_shared_buffer(self._buf_ptrs[self.rank])
+        buf_ptrs = getattr(self, "_buf_ptrs", None)
+        if buf_ptrs is not None:
+            ops.free_shared_buffer(buf_ptrs[self.rank])
             self._buf_ptrs = None
 
 
@@ -360,6 +413,10 @@ def _mailbox_recv_kernel(
     while tl.min(((v >> 32).to(tl.int32) == seq + 1).to(tl.int32), axis=0) == 0:
         v = tl.load(src, cache_modifier=".cv")
     tl.store(out_ptr + idx, v.to(tl.int32), mask=m)
+    # Tags are nonzero. Invalidate every consumed word so a variable-length
+    # message cannot leave a tail that matches again after sequence wrap.
+    tl.debug_barrier()
+    tl.store(src, 0, mask=m)
 
 
 class PcieMailbox:
@@ -368,7 +425,9 @@ class PcieMailbox:
     scheme as above). Sending never waits for the receivers, and a receiver
     only waits if it reads a message before it has arrived. Message `seq` goes
     to slot `seq % num_slots`, so the sender must stay less than `num_slots`
-    messages ahead of every receiver. Not for use inside CUDA graphs."""
+    messages ahead of every receiver. Every sent message must be received,
+    including messages whose contents the caller discards. Not for use inside
+    CUDA graphs."""
 
     _BLOCK = 256
 
@@ -390,8 +449,8 @@ class PcieMailbox:
         self.src = src
         self.max_words = max_words
         self.num_slots = num_slots
-        with torch.cuda.device(device):
-            self._buf_ptrs = CustomAllreduce.create_shared_buffer(
+        with torch.accelerator.device_index(device.index):
+            self._buf_ptrs: list[int] | None = CustomAllreduce.create_shared_buffer(
                 num_slots * max_words * 8, group=group
             )
             self._buf_ptr_t = torch.tensor(
@@ -438,6 +497,7 @@ class PcieMailbox:
         )
 
     def close(self) -> None:
-        if getattr(self, "_buf_ptrs", None) is not None:
-            ops.free_shared_buffer(self._buf_ptrs[self.rank])
+        buf_ptrs = getattr(self, "_buf_ptrs", None)
+        if buf_ptrs is not None:
+            ops.free_shared_buffer(buf_ptrs[self.rank])
             self._buf_ptrs = None

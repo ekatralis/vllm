@@ -10,6 +10,7 @@ from typing import Any, TypeAlias
 
 import torch
 
+from vllm.compilation.collective_cudagraph import create_cudagraph
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -333,7 +334,7 @@ class EncoderCudaGraphManager:
             output = self.model.encoder_cudagraph_forward({**values}, path=path)
             output_buffer = torch.empty_like(output)
 
-        graph = torch.cuda.CUDAGraph()
+        graph = create_cudagraph()
         with (
             torch.inference_mode(),
             torch.cuda.graph(graph, pool=self.graph_pool, stream=current_stream()),

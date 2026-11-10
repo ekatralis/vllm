@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from vllm.benchmarks.forward.batch import BenchBatch
+from vllm.compilation.collective_cudagraph import create_cudagraph
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_world_group, graph_capture
 from vllm.forward_context import get_forward_context, override_forward_context
@@ -224,7 +225,7 @@ class ForwardBench:
             reference = _first_tensor(self._run_model()).clone()
             draft_reference = self.drafter.tokens.clone() if self.drafter else None
             stream.synchronize()
-            graph = torch.cuda.CUDAGraph()
+            graph = create_cudagraph()
             with torch.cuda.graph(graph, stream=stream):
                 restore()
                 if world.world_size > 1:

@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.benchmarks.forward.capture import ForwardBench, _compare, write_input_ids
+from vllm.compilation.collective_cudagraph import create_cudagraph
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -170,10 +171,10 @@ class PipelineBench(ForwardBench):
             for key, tensor in self.input_snapshots.items():
                 self.input_tensors.tensors[key].copy_(tensor)
             capture_context.stream.synchronize()
-            self.reset_graph = torch.cuda.CUDAGraph()
+            self.reset_graph = create_cudagraph()
             with torch.cuda.graph(self.reset_graph, stream=capture_context.stream):
                 self._restore()
-            self.graph = torch.cuda.CUDAGraph()
+            self.graph = create_cudagraph()
             with torch.cuda.graph(self.graph, stream=capture_context.stream):
                 self.output = self._run_model()
         for key, tensor in self.input_snapshots.items():

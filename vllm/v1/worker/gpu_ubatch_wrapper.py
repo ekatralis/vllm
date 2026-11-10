@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from vllm.compilation.collective_cudagraph import create_cudagraph
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -180,7 +181,7 @@ class UBatchWrapper:
 
             # Capture the cudagraph
             cudagraph_metadata = CUDAGraphMetaData(
-                cudagraph=torch.cuda.CUDAGraph(),
+                cudagraph=create_cudagraph(),
                 ubatch_metadata=ubatch_metadata,
             )
             if self.graph_pool is not None:

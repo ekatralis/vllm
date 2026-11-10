@@ -34,6 +34,7 @@ from typing import Any, ClassVar, TypeVar
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.collective_cudagraph import create_cudagraph
 from vllm.compilation.cudagraph_pool import capture_pool
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
@@ -184,7 +185,7 @@ class BreakableCUDAGraphCapture:
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        g = torch.cuda.CUDAGraph()
+        g = create_cudagraph()
         if self.pool is not None:
             g.capture_begin(pool=self.pool)
         else:

@@ -476,6 +476,27 @@ To use the docker image as base for development, you can launch it in interactiv
 --8<-- [end:build-image-from-source]
 --8<-- [start:supported-features]
 
+#### Long-running MI100 PCIe communication
+
+On gfx908, `VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE=1` (the default) enables the
+small-message PCIe collective path when peer access is available. Its call
+tags are reset automatically before they can repeat. All ranks in the tensor
+parallel group finish prior communication, clear both receive-buffer halves,
+and restart the counters together. This can cause a rare latency pause;
+the normal collective kernels keep their existing message format.
+
+vLLM accounts for both eager calls and CUDA graph replays. Each graph's entire
+collective count is reserved before replay, so maintenance never occurs inside
+a graph. Custom captures using raw `torch.cuda.CUDAGraph` fall back to RCCL
+through the communicator; vLLM's graph wrappers retain the PCIe fast path.
+
+The pipeline-parallel PCIe mailbox invalidates words after receiving them,
+including messages for finished or cancelled requests. This prevents stale
+tails from matching reused message tags without a pipeline-wide reset. It adds
+a local-memory write per received word, and discarded messages must still be
+drained. GPU latency and throughput impact should be measured on the deployment
+hardware.
+
 See [Feature x Hardware](../../features/README.md#feature-x-hardware) compatibility matrix for feature support information.
 
 --8<-- [end:supported-features]
