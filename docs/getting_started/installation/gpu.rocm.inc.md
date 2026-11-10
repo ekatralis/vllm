@@ -476,6 +476,17 @@ To use the docker image as base for development, you can launch it in interactiv
 --8<-- [end:build-image-from-source]
 --8<-- [start:supported-features]
 
+#### Long-running MI100 PCIe communication
+
+The gfx908 PCIe collectives enabled by `VLLM_ROCM_PCIE_CUSTOM_ALLREDUCE`
+(on by default) erase received words after reading them. Tags cycle through
+`1..2**30`, preserving the alternating buffer halves and keeping zero reserved
+for empty words. This also runs inside CUDA graph replays, without host counters
+or periodic synchronization pauses. The PP mailbox likewise erases consumed
+words, including messages for finished or cancelled requests that must still
+be drained. Both paths add local-memory writes; their performance impact needs
+measurement on the deployment hardware.
+
 See [Feature x Hardware](../../features/README.md#feature-x-hardware) compatibility matrix for feature support information.
 
 --8<-- [end:supported-features]

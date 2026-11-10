@@ -619,6 +619,20 @@ steps:
       - pytest -v -s tests/distributed/test_quick_all_reduce.py
       - pytest -v -s tests/distributed/test_aiter_rms_fallback.py
 
+- label: ":amd: (MI355) PCIe collective epoch cycle"
+  key: pcie-collective-cycle
+  device: mi355_4
+  working_dir: /vllm-workspace/
+  timeout_in_minutes: 10
+  depends_on:
+  - image-build-amd
+  source_file_dependencies:
+  - vllm/distributed/device_communicators/triton_pcie_collectives.py
+  - vllm/v1/worker/gpu/pp_utils.py
+  - tests/distributed/test_triton_pcie_collectives.py
+  commands:
+  - pytest -v -s tests/distributed/test_triton_pcie_collectives.py
+
 - label: ":nvidia: (B200) [Nightly] Distributed"
   key: distributed-tests-2xb200
   automatic_shard: true

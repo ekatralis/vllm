@@ -21,7 +21,9 @@ by looking at it, with no separate ready flag to race against:
 All programs take part in every call, so each program's call counter is the
 same on every rank. Kernels on one stream do not overlap, so once a rank has
 received call e from a peer, that peer has finished reading call e-1; a rank
-writing call e+1 therefore never overwrites data a peer still needs.
+writing call e+1 therefore never overwrites data a peer still needs or clears.
+Readers invalidate consumed words with tag zero. Nonzero call tags cycle over
+an even period, preserving buffer alternation without retaining stale tails.
 The kernel has no per-call host arguments and can be captured in CUDA graphs.
 """
 
@@ -43,6 +45,7 @@ _NUM_WARPS = 4
 # All-reduces from this size use the two-shot kernel. 4 MI100s, bf16 x 2560:
 # 1/3/6/24/48 rows one-shot 9/17/42/192/466 us, two-shot 17/18/21/91/183 us.
 _TWO_SHOT_MIN_BYTES = 20 * 1024
+_EPOCH_PERIOD = 1 << 30
 
 
 @triton.jit
@@ -74,11 +77,10 @@ def _pcie_ll_kernel(
     BLOCK: tl.constexpr,
     GATHER: tl.constexpr,
     DTYPE: tl.constexpr,  # element type for reduce: float32, float16, bfloat16
+    EPOCH_PERIOD: tl.constexpr,
 ):
     p = tl.program_id(0)
-    e = tl.load(epoch_ptr + p) + 1
-    # `& 1`, not `% 2`: the int32 call counter wraps to negative values after 2^31 calls,
-    # where `e % 2` is -1 and would address memory before the buffer.
+    e = (tl.load(epoch_ptr + p) & (EPOCH_PERIOD - 1)) + 1
     half = (e & 1).to(tl.int64) * (W * SLOT_WORDS)
     chunk = tl.cdiv(tl.cdiv(n, NUM_PROGRAMS), BLOCK) * BLOCK
     start = p * chunk
@@ -97,34 +99,28 @@ def _pcie_ll_kernel(
             dst = tl.multiple_of(dst + half + rank * SLOT_WORDS, 16)
             tl.store(dst + idx, pair, mask=m)
 
+    tl.debug_barrier()
     # 2./3. Read every slot of the local receive buffer once all its words
     #       carry this call number (polling local memory only).
     my_buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64)) + half
     for k in range(start, end, BLOCK):
         idx = k + offs
         m = idx < end
-        # Lanes past the end re-read the last word instead of being masked:
-        # masked loads in this loop are miscompiled on gfx908 (part of the
-        # tail is replaced by the `other` value, so the wait never ends).
-        idx_c = tl.minimum(idx, end - 1)
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         acc_hi = tl.zeros((BLOCK,), dtype=tl.float32)
         for j in tl.static_range(W):
             src = tl.multiple_of(my_buf + j * SLOT_WORDS, 16)
-            v = tl.load(src + idx_c, cache_modifier=".cv")
-            while tl.min(((v >> 32).to(tl.int32) == e).to(tl.int32), axis=0) == 0:
-                v = tl.load(src + idx_c, cache_modifier=".cv")
-            w = v.to(tl.int32)  # low 32 bits
+            w = _wait_ll(src, idx, end, e)
             if GATHER:
                 tl.store(out_ptr + j * n + idx, w, mask=m)
-            elif DTYPE == tl.float32:
+            elif tl.float32 == DTYPE:
                 acc += w.to(tl.float32, bitcast=True)
             else:
                 lo, hi = _unpack16(w, DTYPE)
                 acc += lo
                 acc_hi += hi
         if not GATHER:
-            if DTYPE == tl.float32:
+            if tl.float32 == DTYPE:
                 res = acc.to(tl.int32, bitcast=True)
             else:
                 res = _pack16(acc, acc_hi, DTYPE)
@@ -134,10 +130,16 @@ def _pcie_ll_kernel(
 
 
 @triton.jit
-def _wait_ll(src, idx_c, e):
+def _wait_ll(src, idx, end, e):
+    # Clamp tail lanes: masked loads in this wait loop miscompile on gfx908.
+    idx_c = tl.minimum(idx, end - 1)
     v = tl.load(src + idx_c, cache_modifier=".cv")
     while tl.min(((v >> 32).to(tl.int32) == e).to(tl.int32), axis=0) == 0:
         v = tl.load(src + idx_c, cache_modifier=".cv")
+    # Complete every lane's read before clearing, including clamped tail lanes.
+    # Zero is never a live tag, even when a later call reuses this epoch.
+    tl.debug_barrier()
+    tl.store(src + idx, 0, mask=idx < end)
     return v.to(tl.int32)
 
 
@@ -154,13 +156,14 @@ def _pcie_ll_two_shot_kernel(
     NUM_PROGRAMS: tl.constexpr,
     BLOCK: tl.constexpr,
     DTYPE: tl.constexpr,
+    EPOCH_PERIOD: tl.constexpr,
 ):
     """All-reduce as reduce-scatter + all-gather, half the PCIe traffic of
     _pcie_ll_kernel for 4 GPUs. The input is split into W chunks; rank j
     reduces chunk j and sends the result to everyone. Program p handles the
     same slice of a chunk in both phases, so no sync between programs."""
     p = tl.program_id(0)
-    e = tl.load(epoch_ptr + p) + 1
+    e = (tl.load(epoch_ptr + p) & (EPOCH_PERIOD - 1)) + 1
     c = tl.cdiv(n, W)  # chunk words
     half = (e & 1).to(tl.int64) * HALF_WORDS  # see _pcie_ll_kernel
     rs_off = half  # phase 1 area: [W senders, c]
@@ -184,22 +187,22 @@ def _pcie_ll_two_shot_kernel(
             pair = tag | (w.to(tl.int64) & 0xFFFFFFFF)
             tl.store(dst + rs_off + rank * c + idx, pair, mask=m)
 
+    tl.debug_barrier()
     # 2. Reduce chunk `rank` in rank order and send it to every rank.
     for k in range(start, end, BLOCK):
         idx = k + offs
         m = idx < end
-        idx_c = tl.minimum(idx, end - 1)
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         acc_hi = tl.zeros((BLOCK,), dtype=tl.float32)
         for j in tl.static_range(W):
-            w = _wait_ll(my_buf + rs_off + j * c, idx_c, e)
-            if DTYPE == tl.float32:
+            w = _wait_ll(my_buf + rs_off + j * c, idx, end, e)
+            if tl.float32 == DTYPE:
                 acc += w.to(tl.float32, bitcast=True)
             else:
                 lo, hi = _unpack16(w, DTYPE)
                 acc += lo
                 acc_hi += hi
-        if DTYPE == tl.float32:
+        if tl.float32 == DTYPE:
             res = acc.to(tl.int32, bitcast=True)
         else:
             res = _pack16(acc, acc_hi, DTYPE)
@@ -208,13 +211,13 @@ def _pcie_ll_two_shot_kernel(
             dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
             tl.store(dst + ag_off + rank * c + idx, pair, mask=m)
 
+    tl.debug_barrier()
     # 3. Collect every reduced chunk.
     for k in range(start, end, BLOCK):
         idx = k + offs
         m = idx < end
-        idx_c = tl.minimum(idx, end - 1)
         for j in tl.static_range(W):
-            w = _wait_ll(my_buf + ag_off + j * c, idx_c, e)
+            w = _wait_ll(my_buf + ag_off + j * c, idx, end, e)
             g = j * c + idx
             tl.store(out_ptr + g, w, mask=m & (g < n))
 
@@ -231,7 +234,14 @@ _TL_DTYPES = {
 class PcieCollectives:
     """All-reduce and all-gather of small tensors over PCIe peer memory."""
 
-    def __init__(self, group: ProcessGroup, device: torch.device, max_bytes: int):
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device,
+        max_bytes: int,
+        *,
+        epoch_period: int = _EPOCH_PERIOD,
+    ):
         """group: a CPU (gloo) group whose ranks are this node's GPUs."""
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
@@ -243,10 +253,13 @@ class PcieCollectives:
         self.world_size = dist.get_world_size(group)
         self.max_bytes = max_bytes
         self._slot_words = max_bytes // 4
-        with torch.cuda.device(device):
+        if not 2 <= epoch_period <= _EPOCH_PERIOD or epoch_period & (epoch_period - 1):
+            raise ValueError("epoch_period must be a power of two in [2, 2**30]")
+        self._epoch_period = epoch_period
+        with torch.accelerator.device_index(device.index):
             # Receive buffer: 2 halves x one slot per sender, 8 bytes per word.
             # Zero-filled; call numbers start at 1.
-            self._buf_ptrs = CustomAllreduce.create_shared_buffer(
+            self._buf_ptrs: list[int] | None = CustomAllreduce.create_shared_buffer(
                 2 * self.world_size * self._slot_words * 8, group=group
             )
             self._buf_ptr_t = torch.tensor(
@@ -278,6 +291,7 @@ class PcieCollectives:
             BLOCK=_BLOCK,
             GATHER=gather,
             DTYPE=_TL_DTYPES[inp.dtype],
+            EPOCH_PERIOD=self._epoch_period,
             num_warps=_NUM_WARPS,
         )
 
@@ -298,6 +312,7 @@ class PcieCollectives:
                 NUM_PROGRAMS=_NUM_PROGRAMS,
                 BLOCK=_BLOCK,
                 DTYPE=_TL_DTYPES[inp.dtype],
+                EPOCH_PERIOD=self._epoch_period,
                 num_warps=_NUM_WARPS,
             )
         else:
@@ -311,8 +326,9 @@ class PcieCollectives:
         return out
 
     def close(self) -> None:
-        if getattr(self, "_buf_ptrs", None) is not None:
-            ops.free_shared_buffer(self._buf_ptrs[self.rank])
+        buf_ptrs = getattr(self, "_buf_ptrs", None)
+        if buf_ptrs is not None:
+            ops.free_shared_buffer(buf_ptrs[self.rank])
             self._buf_ptrs = None
 
 
@@ -352,14 +368,10 @@ def _mailbox_recv_kernel(
 ):
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = idx < n
-    # Clamped instead of masked inside the wait loop (see _pcie_ll_kernel).
-    idx_c = tl.minimum(idx, n - 1)
     buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64))
-    src = buf + (seq % NUM_SLOTS).to(tl.int64) * SLOT_WORDS + idx_c
-    v = tl.load(src, cache_modifier=".cv")
-    while tl.min(((v >> 32).to(tl.int32) == seq + 1).to(tl.int32), axis=0) == 0:
-        v = tl.load(src, cache_modifier=".cv")
-    tl.store(out_ptr + idx, v.to(tl.int32), mask=m)
+    src = buf + (seq % NUM_SLOTS).to(tl.int64) * SLOT_WORDS
+    w = _wait_ll(src, idx, n, seq + 1)
+    tl.store(out_ptr + idx, w, mask=m)
 
 
 class PcieMailbox:
@@ -368,7 +380,9 @@ class PcieMailbox:
     scheme as above). Sending never waits for the receivers, and a receiver
     only waits if it reads a message before it has arrived. Message `seq` goes
     to slot `seq % num_slots`, so the sender must stay less than `num_slots`
-    messages ahead of every receiver. Not for use inside CUDA graphs."""
+    messages ahead of every receiver. Every sent message must be received,
+    including messages whose contents the caller discards. Not for use inside
+    CUDA graphs."""
 
     _BLOCK = 256
 
@@ -390,8 +404,8 @@ class PcieMailbox:
         self.src = src
         self.max_words = max_words
         self.num_slots = num_slots
-        with torch.cuda.device(device):
-            self._buf_ptrs = CustomAllreduce.create_shared_buffer(
+        with torch.accelerator.device_index(device.index):
+            self._buf_ptrs: list[int] | None = CustomAllreduce.create_shared_buffer(
                 num_slots * max_words * 8, group=group
             )
             self._buf_ptr_t = torch.tensor(
@@ -438,6 +452,7 @@ class PcieMailbox:
         )
 
     def close(self) -> None:
-        if getattr(self, "_buf_ptrs", None) is not None:
-            ops.free_shared_buffer(self._buf_ptrs[self.rank])
+        buf_ptrs = getattr(self, "_buf_ptrs", None)
+        if buf_ptrs is not None:
+            ops.free_shared_buffer(buf_ptrs[self.rank])
             self._buf_ptrs = None
