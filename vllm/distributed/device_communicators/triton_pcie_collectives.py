@@ -77,7 +77,9 @@ def _pcie_ll_kernel(
 ):
     p = tl.program_id(0)
     e = tl.load(epoch_ptr + p) + 1
-    half = (e % 2).to(tl.int64) * (W * SLOT_WORDS)
+    # `& 1`, not `% 2`: the int32 call counter wraps to negative values after 2^31 calls,
+    # where `e % 2` is -1 and would address memory before the buffer.
+    half = (e & 1).to(tl.int64) * (W * SLOT_WORDS)
     chunk = tl.cdiv(tl.cdiv(n, NUM_PROGRAMS), BLOCK) * BLOCK
     start = p * chunk
     end = tl.minimum(start + chunk, n)
@@ -160,7 +162,7 @@ def _pcie_ll_two_shot_kernel(
     p = tl.program_id(0)
     e = tl.load(epoch_ptr + p) + 1
     c = tl.cdiv(n, W)  # chunk words
-    half = (e % 2).to(tl.int64) * HALF_WORDS
+    half = (e & 1).to(tl.int64) * HALF_WORDS  # see _pcie_ll_kernel
     rs_off = half  # phase 1 area: [W senders, c]
     ag_off = half + W * c  # phase 2 area: [W chunks, c]
     chunk = tl.cdiv(tl.cdiv(c, NUM_PROGRAMS), BLOCK) * BLOCK
@@ -395,6 +397,11 @@ class PcieMailbox:
             self._buf_ptr_t = torch.tensor(
                 self._buf_ptrs, dtype=torch.int64, device=device
             )
+        # Messages are numbered modulo this period, a multiple of num_slots, so the
+        # kernels always get an int32 `seq` (`seq + 1`, the tag, stays in 1..2^31-2).
+        # A Python int past 2^31 would be passed as int64, its tag would no longer
+        # match the int32 read back, and recv would wait forever.
+        self._seq_period = (2**31 - 2) // num_slots * num_slots
 
     def send(self, words: torch.Tensor, seq: int) -> None:
         assert self.rank == self.src and words.dtype == torch.int32
@@ -404,7 +411,7 @@ class PcieMailbox:
             words.contiguous().view(-1),
             self._buf_ptr_t,
             n,
-            seq,
+            seq % self._seq_period,
             self.src,
             self.max_words,
             NUM_SLOTS=self.num_slots,
@@ -422,7 +429,7 @@ class PcieMailbox:
             out.view(-1),
             self._buf_ptr_t,
             n,
-            seq,
+            seq % self._seq_period,
             self.rank,
             self.max_words,
             NUM_SLOTS=self.num_slots,
