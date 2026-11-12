@@ -164,3 +164,31 @@ def test_draft_limit_applies_before_hybrid_mamba_block_size():
     ).create_engine_config()
     assert vllm_config.model_config.max_model_len == 1024
     assert vllm_config.cache_config.mamba_block_size == 1024
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("override_max_position_embeddings", [True, False])
+def test_yarn_mtp_draft_runs_to_target_max_model_len(
+    override_max_position_embeddings: bool, monkeypatch: pytest.MonkeyPatch
+):
+    """A YaRN MTP draft of a hybrid target served past its native length gets
+    the target's max_model_len when its rotary cache (orig * factor) covers it,
+    so configs built from the draft's ModelConfig agree with the target's
+    mamba_block_size (Qwen4Exp's MTP rebuilds a VllmConfig for its draft)."""
+    text_config: dict = {"rope_parameters": _yarn(262144, 4.0)}
+    if override_max_position_embeddings:
+        text_config["max_position_embeddings"] = 1048576
+    else:
+        monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    vllm_config = EngineArgs(
+        model=MTP_TARGET,
+        max_model_len=1_000_000,
+        enable_prefix_caching=False,
+        hf_overrides={"text_config": text_config},
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    ).create_engine_config()
+    draft = vllm_config.speculative_config.draft_model_config
+    assert vllm_config.model_config.max_model_len == 1_000_000
+    assert draft.max_model_len == 1_000_000
+    assert vllm_config.cache_config.mamba_block_size == 1_000_000
+    assert draft.hf_text_config.rope_parameters["rope_type"] == "yarn"
