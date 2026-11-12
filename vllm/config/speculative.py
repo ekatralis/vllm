@@ -1604,6 +1604,36 @@ class SpeculativeConfig:
         return result
 
     @staticmethod
+    def _maybe_raise_yarn_draft_max_model_len(
+        draft_model_config: ModelConfig, target_max_model_len: int
+    ) -> None:
+        """Let a YaRN draft that shares the target's positions run as long as
+        the target when its rotary cache covers it.
+
+        `max_position_embeddings` stays target-only (#63909), so such a draft's
+        own `max_model_len` keeps the checkpoint's native length even though its
+        YaRN cos_sin_cache (`original_max_position_embeddings * factor`)
+        covers the target's `max_model_len`, and `DraftModelSpeculatorConfig`
+        already lets it speculate that far. Code that builds a config from the
+        draft's `ModelConfig` then sees two lengths; e.g. hybrid models fail
+        the mamba-block-size check (block size = target max_model_len).
+        """
+        positions = _yarn_cache_positions(draft_model_config.hf_text_config)
+        if (
+            positions is not None
+            and positions >= target_max_model_len
+            and draft_model_config.max_model_len < target_max_model_len
+        ):
+            logger.info(
+                "YaRN draft rotary cache covers %d positions: raising draft "
+                "max model len from %d to the target's %d",
+                positions,
+                draft_model_config.max_model_len,
+                target_max_model_len,
+            )
+            draft_model_config.max_model_len = target_max_model_len
+
+    @staticmethod
     def _maybe_override_draft_max_position_embeddings(
         draft_hf_config: PreTrainedConfig,
         target_max_model_len: int,

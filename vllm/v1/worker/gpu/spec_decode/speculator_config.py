@@ -256,6 +256,10 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
                 spec.target_parallel_config, spec.draft_decode_context_parallel_size
             )
         )
+        if config_cls.shares_target_positions and spec.max_model_len is None:
+            SpeculativeConfig._maybe_raise_yarn_draft_max_model_len(
+                spec.draft_model_config, target.max_model_len
+            )
         spec.draft_model_config.max_model_len = (
             SpeculativeConfig._maybe_override_draft_max_model_len(
                 spec.max_model_len,
