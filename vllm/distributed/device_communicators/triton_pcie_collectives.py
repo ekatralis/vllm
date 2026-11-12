@@ -8,9 +8,10 @@ XGMI-connected GPUs, and over PCIe it can read a peer's data before that data
 has landed (the ready flag and the data take different paths), returning values
 from an earlier call.
 
-This uses the "LL" scheme instead: every 4-byte data word is sent together
-with the call number in one 8-byte write, so a reader knows a word is current
-by looking at it, with no separate ready flag to race against:
+This uses the "LL" scheme instead: data is sent as 8-byte wire words that each
+carry 16 data bits and a 48-bit call number, written in one store, so a reader
+knows a word is current by looking at it, with no separate ready flag to race
+against (a 4-byte data word travels as two wire words):
   1. each program writes its slice of the input, as (call, word) pairs, into
      every rank's receive buffer (this rank's slot; one of two buffer halves,
      alternating per call). Remote writes over PCIe do not wait for replies.
@@ -22,6 +23,10 @@ All programs take part in every call, so each program's call counter is the
 same on every rank. Kernels on one stream do not overlap, so once a rank has
 received call e from a peer, that peer has finished reading call e-1; a rank
 writing call e+1 therefore never overwrites data a peer still needs.
+Call numbers are int64 and the 48-bit tag cycles through 1..2^48-1 (about 900
+years at 10k calls/s), so a tag is never reused in practice: words left over in
+the receive buffer from earlier calls (e.g. the tail of a larger message) never
+match a later call, and zero-filled memory never matches any call.
 The kernel has no per-call host arguments and can be captured in CUDA graphs.
 """
 
@@ -60,12 +65,50 @@ def _pack16(lo, hi, DTYPE: tl.constexpr):
     return lo16 | (hi16 << 16)
 
 
+_TAG_PERIOD = (1 << 48) - 1  # tags are 1.._TAG_PERIOD, 0 never matches
+
+
+@triton.jit
+def _tag48(e):
+    """Call number (int64, >= 1) -> 48-bit tag in 1..2^48-1, shifted into place."""
+    return (((e - 1) % 281474976710655) + 1) << 16
+
+
+@triton.jit
+def _put_ll(dst, idx, w, tag, m, STRIDE):
+    """Store int32 data words `w` (data index `idx`) as two tagged wire words:
+    low halves at dst[idx], high halves at dst[STRIDE + idx] (planar, so the
+    stores stay contiguous across the warp)."""
+    tl.store(dst + idx, tag | (w.to(tl.int64) & 0xFFFF), mask=m)
+    tl.store(dst + STRIDE + idx, tag | ((w.to(tl.int64) >> 16) & 0xFFFF), mask=m)
+
+
+@triton.jit
+def _tag_ok(lo, hi, tag):
+    lo_ok = ((lo >> 16) << 16) == tag
+    hi_ok = ((hi >> 16) << 16) == tag
+    return (lo_ok & hi_ok).to(tl.int32)
+
+
+@triton.jit
+def _wait_ll(src, idx_c, tag, STRIDE):
+    """Wait until both wire words of data index `idx_c` carry `tag`.
+
+    Returns the int32 data word."""
+    lo = tl.load(src + idx_c, cache_modifier=".cv")
+    hi = tl.load(src + STRIDE + idx_c, cache_modifier=".cv")
+    while tl.min(_tag_ok(lo, hi, tag), axis=0) == 0:
+        lo = tl.load(src + idx_c, cache_modifier=".cv")
+        hi = tl.load(src + STRIDE + idx_c, cache_modifier=".cv")
+    return ((lo & 0xFFFF) | ((hi & 0xFFFF) << 16)).to(tl.int32)
+
+
 @triton.jit
 def _pcie_ll_kernel(
     inp_ptr,  # int32 words
     out_ptr,  # int32 words: [n] (reduce) or [W, n] (gather)
-    buf_ptrs,  # int64[W]: each rank's receive buffer, int64[2, W, SLOT_WORDS]
-    epoch_ptr,  # int32[NUM_PROGRAMS], this rank only
+    buf_ptrs,  # int64[W]: each rank's receive buffer, int64[2, W, 2 * SLOT_WORDS]
+    epoch_ptr,  # int64[NUM_PROGRAMS], this rank only
     n,
     rank,
     SLOT_WORDS,
@@ -76,26 +119,24 @@ def _pcie_ll_kernel(
     DTYPE: tl.constexpr,  # element type for reduce: float32, float16, bfloat16
 ):
     p = tl.program_id(0)
-    e = tl.load(epoch_ptr + p) + 1
-    # `& 1`, not `% 2`: the int32 call counter wraps to negative values after 2^31 calls,
-    # where `e % 2` is -1 and would address memory before the buffer.
-    half = (e & 1).to(tl.int64) * (W * SLOT_WORDS)
+    e = tl.load(epoch_ptr + p) + 1  # int64 call number, never wraps in practice
+    half = (e & 1) * (2 * W * SLOT_WORDS)  # wire words
     chunk = tl.cdiv(tl.cdiv(n, NUM_PROGRAMS), BLOCK) * BLOCK
     start = p * chunk
     end = tl.minimum(start + chunk, n)
     offs = tl.arange(0, BLOCK)
-    tag = e.to(tl.int64) << 32
+    tag = _tag48(e)
 
-    # 1. Push this rank's slice, as (call, word) pairs, into every rank's
+    # 1. Push this rank's slice, as tagged wire words, into every rank's
     #    receive buffer (slot `rank`). Remote writes over PCIe do not wait.
     for k in range(start, end, BLOCK):
         idx = k + offs
         m = idx < end
-        pair = tag | (tl.load(inp_ptr + idx, mask=m).to(tl.int64) & 0xFFFFFFFF)
+        w = tl.load(inp_ptr + idx, mask=m)
         for j in tl.static_range(W):
             dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
-            dst = tl.multiple_of(dst + half + rank * SLOT_WORDS, 16)
-            tl.store(dst + idx, pair, mask=m)
+            dst = tl.multiple_of(dst + half + 2 * rank * SLOT_WORDS, 16)
+            _put_ll(dst, idx, w, tag, m, SLOT_WORDS)
 
     # 2./3. Read every slot of the local receive buffer once all its words
     #       carry this call number (polling local memory only).
@@ -110,11 +151,8 @@ def _pcie_ll_kernel(
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         acc_hi = tl.zeros((BLOCK,), dtype=tl.float32)
         for j in tl.static_range(W):
-            src = tl.multiple_of(my_buf + j * SLOT_WORDS, 16)
-            v = tl.load(src + idx_c, cache_modifier=".cv")
-            while tl.min(((v >> 32).to(tl.int32) == e).to(tl.int32), axis=0) == 0:
-                v = tl.load(src + idx_c, cache_modifier=".cv")
-            w = v.to(tl.int32)  # low 32 bits
+            src = tl.multiple_of(my_buf + 2 * j * SLOT_WORDS, 16)
+            w = _wait_ll(src, idx_c, tag, SLOT_WORDS)
             if GATHER:
                 tl.store(out_ptr + j * n + idx, w, mask=m)
             elif DTYPE == tl.float32:
@@ -134,19 +172,11 @@ def _pcie_ll_kernel(
 
 
 @triton.jit
-def _wait_ll(src, idx_c, e):
-    v = tl.load(src + idx_c, cache_modifier=".cv")
-    while tl.min(((v >> 32).to(tl.int32) == e).to(tl.int32), axis=0) == 0:
-        v = tl.load(src + idx_c, cache_modifier=".cv")
-    return v.to(tl.int32)
-
-
-@triton.jit
 def _pcie_ll_two_shot_kernel(
     inp_ptr,  # int32 words
     out_ptr,  # int32 words
     buf_ptrs,  # int64[W]: each rank's receive buffer
-    epoch_ptr,  # int32[NUM_PROGRAMS], this rank only
+    epoch_ptr,  # int64[NUM_PROGRAMS], this rank only
     n,
     rank,
     HALF_WORDS,
@@ -162,14 +192,15 @@ def _pcie_ll_two_shot_kernel(
     p = tl.program_id(0)
     e = tl.load(epoch_ptr + p) + 1
     c = tl.cdiv(n, W)  # chunk words
-    half = (e & 1).to(tl.int64) * HALF_WORDS  # see _pcie_ll_kernel
+    # Offsets in data words; the buffer holds two wire words per data word.
+    half = (e & 1) * HALF_WORDS
     rs_off = half  # phase 1 area: [W senders, c]
     ag_off = half + W * c  # phase 2 area: [W chunks, c]
     chunk = tl.cdiv(tl.cdiv(c, NUM_PROGRAMS), BLOCK) * BLOCK
     start = p * chunk
     end = tl.minimum(start + chunk, c)
     offs = tl.arange(0, BLOCK)
-    tag = e.to(tl.int64) << 32
+    tag = _tag48(e)
     my_buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64))
 
     # 1. Send slice of chunk j to rank j (padding past n is sent as zeros,
@@ -181,8 +212,7 @@ def _pcie_ll_two_shot_kernel(
             g = j * c + idx
             w = tl.load(inp_ptr + g, mask=m & (g < n), other=0)
             dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
-            pair = tag | (w.to(tl.int64) & 0xFFFFFFFF)
-            tl.store(dst + rs_off + rank * c + idx, pair, mask=m)
+            _put_ll(dst + 2 * (rs_off + rank * c), idx, w, tag, m, c)
 
     # 2. Reduce chunk `rank` in rank order and send it to every rank.
     for k in range(start, end, BLOCK):
@@ -192,7 +222,7 @@ def _pcie_ll_two_shot_kernel(
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         acc_hi = tl.zeros((BLOCK,), dtype=tl.float32)
         for j in tl.static_range(W):
-            w = _wait_ll(my_buf + rs_off + j * c, idx_c, e)
+            w = _wait_ll(my_buf + 2 * (rs_off + j * c), idx_c, tag, c)
             if DTYPE == tl.float32:
                 acc += w.to(tl.float32, bitcast=True)
             else:
@@ -203,10 +233,9 @@ def _pcie_ll_two_shot_kernel(
             res = acc.to(tl.int32, bitcast=True)
         else:
             res = _pack16(acc, acc_hi, DTYPE)
-        pair = tag | (res.to(tl.int64) & 0xFFFFFFFF)
         for j in tl.static_range(W):
             dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
-            tl.store(dst + ag_off + rank * c + idx, pair, mask=m)
+            _put_ll(dst + 2 * (ag_off + rank * c), idx, res, tag, m, c)
 
     # 3. Collect every reduced chunk.
     for k in range(start, end, BLOCK):
@@ -214,7 +243,7 @@ def _pcie_ll_two_shot_kernel(
         m = idx < end
         idx_c = tl.minimum(idx, end - 1)
         for j in tl.static_range(W):
-            w = _wait_ll(my_buf + ag_off + j * c, idx_c, e)
+            w = _wait_ll(my_buf + 2 * (ag_off + j * c), idx_c, tag, c)
             g = j * c + idx
             tl.store(out_ptr + g, w, mask=m & (g < n))
 
@@ -244,15 +273,15 @@ class PcieCollectives:
         self.max_bytes = max_bytes
         self._slot_words = max_bytes // 4
         with torch.cuda.device(device):
-            # Receive buffer: 2 halves x one slot per sender, 8 bytes per word.
-            # Zero-filled; call numbers start at 1.
+            # Receive buffer: 2 halves x one slot per sender, two 8-byte wire
+            # words per 4-byte data word. Zero-filled; tags start at 1.
             self._buf_ptrs = CustomAllreduce.create_shared_buffer(
-                2 * self.world_size * self._slot_words * 8, group=group
+                2 * self.world_size * self._slot_words * 16, group=group
             )
             self._buf_ptr_t = torch.tensor(
                 self._buf_ptrs, dtype=torch.int64, device=device
             )
-            self._epoch = torch.zeros(_NUM_PROGRAMS, dtype=torch.int32, device=device)
+            self._epoch = torch.zeros(_NUM_PROGRAMS, dtype=torch.int64, device=device)
 
     def should_use(self, inp: torch.Tensor, max_bytes: int | None = None) -> bool:
         nbytes = inp.numel() * inp.element_size()
@@ -319,7 +348,7 @@ class PcieCollectives:
 @triton.jit(do_not_specialize=["n", "seq"])
 def _mailbox_send_kernel(
     inp_ptr,  # int32 words
-    buf_ptrs,  # int64[W]: each rank's mailbox, int64[NUM_SLOTS, SLOT_WORDS]
+    buf_ptrs,  # int64[W]: each rank's mailbox, int64[NUM_SLOTS, 2 * SLOT_WORDS]
     n,
     seq,
     src,
@@ -330,19 +359,20 @@ def _mailbox_send_kernel(
 ):
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = idx < n
-    tag = (seq + 1).to(tl.int64) << 32
-    pair = tag | (tl.load(inp_ptr + idx, mask=m).to(tl.int64) & 0xFFFFFFFF)
-    slot = (seq % NUM_SLOTS).to(tl.int64) * SLOT_WORDS
+    seq64 = seq.to(tl.int64)
+    tag = _tag48(seq64 + 1)
+    w = tl.load(inp_ptr + idx, mask=m)
+    slot = (seq64 % NUM_SLOTS) * (2 * SLOT_WORDS)
     for j in tl.static_range(W):
         if j != src:
             dst = tl.load(buf_ptrs + j).to(tl.pointer_type(tl.int64))
-            tl.store(dst + slot + idx, pair, mask=m)
+            _put_ll(dst + slot, idx, w, tag, m, SLOT_WORDS)
 
 
 @triton.jit(do_not_specialize=["n", "seq"])
 def _mailbox_recv_kernel(
     out_ptr,  # int32 words
-    buf_ptrs,  # int64[W]: each rank's mailbox, int64[NUM_SLOTS, SLOT_WORDS]
+    buf_ptrs,  # int64[W]: each rank's mailbox, int64[NUM_SLOTS, 2 * SLOT_WORDS]
     n,
     seq,
     rank,
@@ -354,12 +384,11 @@ def _mailbox_recv_kernel(
     m = idx < n
     # Clamped instead of masked inside the wait loop (see _pcie_ll_kernel).
     idx_c = tl.minimum(idx, n - 1)
+    seq64 = seq.to(tl.int64)
     buf = tl.load(buf_ptrs + rank).to(tl.pointer_type(tl.int64))
-    src = buf + (seq % NUM_SLOTS).to(tl.int64) * SLOT_WORDS + idx_c
-    v = tl.load(src, cache_modifier=".cv")
-    while tl.min(((v >> 32).to(tl.int32) == seq + 1).to(tl.int32), axis=0) == 0:
-        v = tl.load(src, cache_modifier=".cv")
-    tl.store(out_ptr + idx, v.to(tl.int32), mask=m)
+    slot = buf + (seq64 % NUM_SLOTS) * (2 * SLOT_WORDS)
+    w = _wait_ll(slot, idx_c, _tag48(seq64 + 1), SLOT_WORDS)
+    tl.store(out_ptr + idx, w, mask=m)
 
 
 class PcieMailbox:
@@ -392,16 +421,11 @@ class PcieMailbox:
         self.num_slots = num_slots
         with torch.cuda.device(device):
             self._buf_ptrs = CustomAllreduce.create_shared_buffer(
-                num_slots * max_words * 8, group=group
+                num_slots * max_words * 16, group=group
             )
             self._buf_ptr_t = torch.tensor(
                 self._buf_ptrs, dtype=torch.int64, device=device
             )
-        # Messages are numbered modulo this period, a multiple of num_slots, so the
-        # kernels always get an int32 `seq` (`seq + 1`, the tag, stays in 1..2^31-2).
-        # A Python int past 2^31 would be passed as int64, its tag would no longer
-        # match the int32 read back, and recv would wait forever.
-        self._seq_period = (2**31 - 2) // num_slots * num_slots
 
     def send(self, words: torch.Tensor, seq: int) -> None:
         assert self.rank == self.src and words.dtype == torch.int32
@@ -411,7 +435,7 @@ class PcieMailbox:
             words.contiguous().view(-1),
             self._buf_ptr_t,
             n,
-            seq % self._seq_period,
+            seq,
             self.src,
             self.max_words,
             NUM_SLOTS=self.num_slots,
@@ -429,7 +453,7 @@ class PcieMailbox:
             out.view(-1),
             self._buf_ptr_t,
             n,
-            seq % self._seq_period,
+            seq,
             self.rank,
             self.max_words,
             NUM_SLOTS=self.num_slots,
