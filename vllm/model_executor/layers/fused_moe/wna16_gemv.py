@@ -14,13 +14,17 @@ even-k value in the low nibble, value = (q - 8) * scale[e, n, k // group_size].
 
 The default path (_moe_wna16_dot2_kernel) is bound by dequant ALU work, not memory,
 so it keeps that work small: weights are read as int32 words, two nibbles at a time
-become fp16 values 1024 + q via (w >> 4s) & 0x000F000F | 0x64006400, and
-v_dot2_f32_f16 multiplies them with fp16 activation pairs into an fp32 accumulator.
-The 1024 + 8 offset is removed per word with a precomputed sum of its activations.
+become fp16 values 1024 + q via (w >> 4s) & 0x000F000F | 0x64006400, one
+v_pk_add_f16 turns them into exact q - 8, and v_dot2_f32_f16 multiplies them with
+fp16 activation pairs into an fp32 accumulator. Subtracting the offset before the
+dot product (not as -1032 * sum(x) afterwards) keeps every product exact, so
+nothing cancels: all-zero weights give exactly 0, and one large activation cannot
+wash out the small ones it shares a word with.
 Activations are first rearranged by _prep_kernel into that pair layout, scaled per
-row by a power of two so fp16 can neither overflow nor lose small values.
-At 12 tokens on MI100 this is ~1.4x faster than the plain multiply-add kernel
-(~700 GB/s vs ~430 GB/s), with the same accuracy.
+row by a power of two so fp16 cannot overflow (bf16 values convert exactly; only
+values below ~2^-26 of the row's largest lose precision).
+At 12 tokens on MI100 this is ~1.4x faster than the plain multiply-add kernel,
+with the same accuracy as it on real model activations.
 """
 
 import torch
@@ -118,10 +122,24 @@ def _dot2(a, b, c):
 
 
 @triton.jit
-def _prep_kernel(x_ptr, xh_ptr, xs_ptr, rs_ptr, K, stride_xm, KW_P2: tl.constexpr):
+def _pk_sub1032(a):
+    # Two fp16 values 1024 + q in one int32 -> exact q - 8 each: v_pk_add_f16 with
+    # fp16 -1032 (0xE408) in both halves.
+    return tl.inline_asm_elementwise(
+        "v_pk_add_f16 $0, $1, $2",
+        "=v,v,v",
+        [a, tl.full(a.shape, -469179384, tl.int32)],  # 0xE408E408 as int32
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _prep_kernel(x_ptr, xh_ptr, rs_ptr, K, stride_xm, KW_P2: tl.constexpr):
     # One program per activation row. Scale by a power of two so max|x| lands in
-    # [2^12, 2^13], store fp16 pairs xh[s, w] = (x[8w + s], x[8w + s + 4]), the fp32
-    # sum of each word's 8 fp16 values in xs[w], and the inverse scale in rs.
+    # [2^12, 2^13], store fp16 pairs xh[s, w] = (x[8w + s], x[8w + s + 4]) and the
+    # inverse scale in rs.
     row = tl.program_id(0).to(tl.int64)
     KW = K // 8
     w = tl.arange(0, KW_P2)
@@ -134,7 +152,6 @@ def _prep_kernel(x_ptr, xh_ptr, xs_ptr, rs_ptr, K, stride_xm, KW_P2: tl.constexp
     e = tl.where(amax > 0, tl.ceil(tl.log2(amax)), 0.0)
     scale = tl.exp2(13.0 - e)
     h = (v * scale).to(tl.float16)
-    tl.store(xs_ptr + row * KW + w, tl.sum(h.to(tl.float32), axis=1), mask=w < KW)
     dst = xh_ptr + row * (8 * KW) + (i % 4)[None, :] * (2 * KW)
     tl.store(dst + w[:, None] * 2 + (i // 4)[None, :], h, mask=m)
     tl.store(rs_ptr + row, 1.0 / scale)
@@ -143,7 +160,6 @@ def _prep_kernel(x_ptr, xh_ptr, xs_ptr, rs_ptr, K, stride_xm, KW_P2: tl.constexp
 @triton.jit
 def _moe_wna16_dot2_kernel(
     xh_ptr,
-    xs_ptr,
     rs_ptr,
     b_ptr,
     scale_ptr,
@@ -188,7 +204,6 @@ def _moe_wna16_dot2_kernel(
     offs_w = tl.arange(0, WORDS)
     row = (pair // x_row_div).to(tl.int64)
     xh = xh_ptr + row * (4 * KW)
-    xs = xs_ptr + row * KW
     b_rows = (
         b_ptr.to(tl.pointer_type(tl.int32))
         + expert * (stride_be // 4)
@@ -203,14 +218,13 @@ def _moe_wna16_dot2_kernel(
         x1 = tl.load(xw + KW)
         x2 = tl.load(xw + 2 * KW)
         x3 = tl.load(xw + 3 * KW)
-        # Each value below is 1024 + q, so start from -(1024 + 8) * sum(x).
-        t = (-1032.0 * tl.load(xs + w0 + offs_w))[None, :] + tl.zeros(
-            (BLOCK_N, WORDS), dtype=tl.float32
-        )
-        t = _dot2((w & 0x000F000F) | 0x64006400, x0[None, :], t)
-        t = _dot2(((w >> 4) & 0x000F000F) | 0x64006400, x1[None, :], t)
-        t = _dot2(((w >> 8) & 0x000F000F) | 0x64006400, x2[None, :], t)
-        t = _dot2(((w >> 12) & 0x000F000F) | 0x64006400, x3[None, :], t)
+        # 1024 + q -> exact q - 8 before the dot product, so no offset is left to
+        # cancel afterwards.
+        t = tl.zeros((BLOCK_N, WORDS), dtype=tl.float32)
+        t = _dot2(_pk_sub1032((w & 0x000F000F) | 0x64006400), x0[None, :], t)
+        t = _dot2(_pk_sub1032(((w >> 4) & 0x000F000F) | 0x64006400), x1[None, :], t)
+        t = _dot2(_pk_sub1032(((w >> 8) & 0x000F000F) | 0x64006400), x2[None, :], t)
+        t = _dot2(_pk_sub1032(((w >> 12) & 0x000F000F) | 0x64006400), x3[None, :], t)
         g = (w0 + offs_w) // GW
         sc = tl.load(s_rows + g[None, :], mask=n_mask[:, None], other=0.0)
         acc += sc.to(tl.float32) * t
@@ -239,12 +253,10 @@ def _moe_wna16_gemv_dot2(
     KW = K // 8
     N = b.shape[1]
     xh = torch.empty(rows, 4, KW, dtype=torch.int32, device=x.device)
-    xs = torch.empty(rows, KW, dtype=torch.float32, device=x.device)
     rs = torch.empty(rows, dtype=torch.float32, device=x.device)
     _prep_kernel[(rows,)](
         x,
         xh.view(torch.float16),
-        xs,
         rs,
         K,
         x.stride(0),
@@ -257,7 +269,6 @@ def _moe_wna16_gemv_dot2(
     grid = (out2.shape[0], triton.cdiv(N, block_n))
     _moe_wna16_dot2_kernel[grid](
         xh,
-        xs,
         rs,
         b,
         b_scale,
