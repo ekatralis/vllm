@@ -802,11 +802,12 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            if not request.is_prefill_chunk:
-                if num_decode_reqs >= max_decode_reqs:
-                    req_index += 1
-                    continue
-                num_decode_reqs += 1
+            if not request.is_prefill_chunk and num_decode_reqs >= max_decode_reqs:
+                # PP decode balancing: this step's decode quota is used up.
+                # The quota is only charged once a decode is scheduled below,
+                # so requests that end up skipped don't take others' places.
+                req_index += 1
+                continue
 
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
@@ -939,6 +940,8 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            if not preempted_req.is_prefill_chunk:
+                                num_decode_reqs -= 1
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
@@ -988,6 +991,8 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            if not request.is_prefill_chunk:
+                num_decode_reqs += 1
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks

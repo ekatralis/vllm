@@ -831,3 +831,41 @@ def test_pp_decodes_spread_over_microbatches(monkeypatch):
     for step, step_after_next in zip(decode_steps, decode_steps[pp_size:]):
         assert step == step_after_next
     assert decode_steps[0].isdisjoint(decode_steps[1])
+
+
+def test_pp_balance_quota_not_taken_by_unscheduled_decode(monkeypatch):
+    """A decode that is eligible but cannot be scheduled this step (here: no
+    tokens to schedule) must not use up the PP balancing quota, or a request
+    behind it that could run is left out and the step is underfilled."""
+    monkeypatch.setenv("VLLM_PP_DECODE_BALANCE_MIN_REQS", "2")
+    pp_size = 2
+    scheduler = _create_async_pp_scheduler(num_spec=0, pp_size=pp_size, num_blocks=64)
+    requests = create_requests(num_requests=4, num_tokens=8, max_tokens=20)
+    for req in requests:
+        scheduler.add_request(req)
+    blocked = requests[0].request_id
+    reserve = scheduler._reserve_prefill_lookahead
+
+    def reserve_except_blocked(request, num_computed_tokens, num_new_tokens):
+        if request.request_id == blocked and not request.is_prefill_chunk:
+            return 0  # e.g. encoder budget or lookahead: skipped this step
+        return reserve(request, num_computed_tokens, num_new_tokens)
+
+    output = scheduler.schedule()  # prefill (not affected)
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+    monkeypatch.setattr(scheduler, "_reserve_prefill_lookahead", reserve_except_blocked)
+    steps = []
+    for _ in range(6):
+        output = scheduler.schedule()
+        steps.append(set(output.num_scheduled_tokens))
+        scheduler.update_from_output(output, _make_model_runner_output(output))
+    decode_steps = [step for step in steps if step]
+    assert decode_steps and all(blocked not in step for step in decode_steps)
+    # Quota is ceil(4 decodes / pp 2) = 2 per step. Every runnable request must
+    # still decode on its every-pp_size-steps cadence; if the blocked request
+    # took a slot, one of them was starved (previously: request "3" never ran).
+    runnable = {r.request_id for r in requests[1:]}
+    assert set().union(*decode_steps) == runnable, steps
+    for req_id in runnable:
+        times = sum(req_id in step for step in decode_steps)
+        assert times >= len(decode_steps) // pp_size, steps
