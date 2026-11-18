@@ -7,7 +7,10 @@
 #   * ROCm 10.3 TheRock tarball in /opt/rocm: compiler and headers for building vLLM's HIP extensions, amd-smi.
 #   * PyTorch / torchvision / Triton / ROCm SDK as TheRock multi-arch wheels for gfx908, pinned to the exact
 #     builds used here. torch pins triton==3.8.0+git3f6e4113.rocm10.1.0a20260822 itself.
-#   * vLLM from the fork, branch mi100-qwen38 (gfx908 kernels, PP fixes, ERR-1/2/3 fixes), editable install.
+#   * vLLM from the fork, branch mi100-qwen38 (gfx908 kernels, PP fixes, ERR-1/2/3/9/14 fixes, MI100-tuned W4A16 MoE
+#     configs), editable install.
+#   * PyTorch TunableOp results for the dense GEMMs (docker/tunableop-mi100-qwen38-tp2pp4/ in the fork; valid only for
+#     the pinned torch/HIP/hipBLASLt/rocBLAS builds below), used by the tp2pp4 recipes: +5-7% prefill.
 #   * vLLM's Rust frontend (vllm-rs) built too; it is only used with VLLM_USE_RUST_FRONTEND=1 (off by default).
 #   * amdsmi Python bindings wired to the venv's own libamd_smi (one HIP/ROCm runtime per process).
 #   * Runtime: /opt/rocm kept OFF LD_LIBRARY_PATH (else Triton refuses to mix two ROCm runtimes), Inductor
@@ -24,6 +27,9 @@
 #     -v /models:/models:ro -v vllm-cache:/root/.cache \
 #     vllm-mi100-qwen38 serve-qwen38 tp2pp4
 #   Extra vllm arguments can follow the recipe name. MODEL=/path overrides the model directory.
+#   tp2pp4 / tp2pp4-yarn run with prefix caching and TunableOp on (QWEN38_TUNABLEOP=0 turns TunableOp off).
+#   CPU KV offload (optional, tp2pp4 recipes): append --kv-offloading-size 384. The region lives in /dev/shm, which
+#   --ipc=host shares with the host; keep it <= 384 GiB (amdgpu driver pinned-memory cap on the MI100 node).
 
 FROM ubuntu:24.04
 
@@ -405,6 +411,13 @@ assert "_TAG_PERIOD = (1 << 48) - 1" in (root / "distributed/device_communicator
 assert "_pk_sub1032" in (root / "model_executor/layers/fused_moe/wna16_gemv.py").read_text(), "exact MoE GEMV missing"
 assert (root / "model_executor/layers/fused_moe/wna16_gemv.py").is_file(), "MI100 MoE decode GEMV missing"
 assert (root / "models/qwen4_exp/amd/model.py").is_file(), "Qwen4Exp AMD port missing"
+moe_cfg = root / "model_executor/layers/fused_moe/configs/E=256,N=640,device_name=AMD_Instinct_MI100,dtype=int4_w4a16.json"
+assert "waves_per_eu" in moe_cfg.read_text(), "MI100 W4A16 MoE config (dea112bfdd) missing"
+assert "max_worker_kv_bytes_per_block" in (root / "v1/kv_cache_interface.py").read_text(), "ERR-14 offload fix missing"
+tun = sorted((root.parent / "docker/tunableop-mi100-qwen38-tp2pp4").glob("tunableop_results*.csv"))
+assert len(tun) == 8, f"TunableOp results missing ({len(tun)} files)"
+torch_ver = m.version("torch").split("a0")[0].split("+")[0]
+assert f"Validator,PT_VERSION,{torch_ver}" in tun[0].read_text(), "TunableOp results were tuned on another torch"
 for so in ("_C.abi3.so", "_rocm_C.abi3.so", "_moe_C_stable_libtorch.abi3.so"):
     assert (root / so).is_file(), so
 print("vllm", vllm.__version__, "| torch", m.version("torch"), "| triton", m.version("triton"),
@@ -419,20 +432,28 @@ set -euo pipefail
 MODEL=${MODEL:-/models/Qwen3.8-Flash-Next-W4A16}
 RECIPE=${1:-tp2pp4}; [ $# -gt 0 ] && shift
 export VLLM_PP_DECODE_BALANCE_MIN_REQS=${VLLM_PP_DECODE_BALANCE_MIN_REQS:-2}
+# Prefix caching (validated for tp2pp4 and tp2pp4-yarn; tp4pp2 keeps the previously validated setting, off).
+CACHE=(--enable-prefix-caching --enable-prompt-tokens-details)
+tunableop() {  # tuned GEMM results for the TP2 x PP4 layout (per-GPU files); untuned shapes use the default kernels
+  if [ "${QWEN38_TUNABLEOP:-1}" = 1 ]; then
+    export PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=0
+    export PYTORCH_TUNABLEOP_FILENAME=${PYTORCH_TUNABLEOP_FILENAME:-/opt/vllm/docker/tunableop-mi100-qwen38-tp2pp4/tunableop_results%d.csv}
+  fi
+}
 SPEC='{"method":"mtp","num_speculative_tokens":2,"use_local_argmax_reduction":true}'
 YARN='{"text_config": {"max_position_embeddings": 1048576, "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
 case "$RECIPE" in
-  tp2pp4)      export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-14,14,15,5}
+  tp2pp4)      export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-14,14,15,5}; tunableop
                ARGS=(--tensor-parallel-size 2 --pipeline-parallel-size 4 --max-model-len 262144) ;;
-  tp2pp4-yarn) export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-14,14,15,5}
+  tp2pp4-yarn) export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-14,14,15,5}; tunableop
                ARGS=(--tensor-parallel-size 2 --pipeline-parallel-size 4 --max-model-len 1000000 --hf-overrides "$YARN") ;;
   tp4pp2)      export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-27,21}
-               ARGS=(--tensor-parallel-size 4 --pipeline-parallel-size 2 --max-model-len 262144) ;;
+               ARGS=(--tensor-parallel-size 4 --pipeline-parallel-size 2 --max-model-len 262144); CACHE=(--no-enable-prefix-caching) ;;
   *) echo "unknown recipe '$RECIPE' (tp2pp4 | tp2pp4-yarn | tp4pp2)" >&2; exit 2 ;;
 esac
 exec vllm serve "$MODEL" --served-model-name qwen38-w4 "${ARGS[@]}" --enable-expert-parallel \
   --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 64 --gpu-memory-utilization 0.94 \
-  --no-enable-prefix-caching --speculative-config "$SPEC" \
+  "${CACHE[@]}" --speculative-config "$SPEC" \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice \
   --trust-remote-code --host 0.0.0.0 --port 8000 "$@"
 EOF
