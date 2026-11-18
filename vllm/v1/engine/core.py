@@ -384,9 +384,21 @@ class EngineCore:
         # The scheduler's config is a deep copy taken before these are resolved,
         # so set them there too: the KV connector's scheduler side reads the same
         # fields as its workers.
+        # Bytes per block differ between workers that hold different layers
+        # (e.g. uneven pipeline stages); layouts shared by all workers (the CPU
+        # offload region) need the maximum, on the scheduler side as well.
+        worker_bytes_per_block = [
+            cfg.kv_cache_tensors[0].size // cfg.num_blocks
+            for cfg in kv_cache_configs
+            if cfg.kv_cache_tensors and cfg.num_blocks > 0
+        ]
+        max_worker_kv_bytes_per_block = max(worker_bytes_per_block, default=None)
         for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
             kv_cache_config.hash_block_size = hash_block_size
             kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+            kv_cache_config.max_worker_kv_bytes_per_block = (
+                max_worker_kv_bytes_per_block
+            )
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         compilation_times = []
