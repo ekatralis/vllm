@@ -534,6 +534,27 @@ def test_worker_kv_bytes_preserves_tensor_layout(packed: bool):
     assert offloading_config.cache.blocks_per_chunk == 2
 
 
+def test_worker_kv_bytes_uses_max_over_workers():
+    """Pipeline stages can hold different layers, so their bytes per block differ.
+    The shared CPU region (equal slot per worker, chunk count sized by the scheduler,
+    which sees one worker's config) must use the largest worker's value on every
+    process, or a larger worker overflows its slot and the region."""
+    config = _make_vllm_config(
+        extra_config={"block_size": 32},
+        tensor_parallel_size=2,
+        pipeline_parallel_size=4,
+    )
+    smaller_worker = _make_sizing_kv_cache_config(packed=True)  # 16 bytes per block
+    assert build_offloading_config(config, smaller_worker).worker_kv_bytes_per_block == 16
+
+    smaller_worker.max_worker_kv_bytes_per_block = 24
+    assert build_offloading_config(config, smaller_worker).worker_kv_bytes_per_block == 24
+
+    largest_worker = _make_sizing_kv_cache_config(packed=True)
+    largest_worker.max_worker_kv_bytes_per_block = 16
+    assert build_offloading_config(config, largest_worker).worker_kv_bytes_per_block == 16
+
+
 def test_offloading_skips_scratch_group():
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     kv_cache_config.kv_cache_groups.insert(
