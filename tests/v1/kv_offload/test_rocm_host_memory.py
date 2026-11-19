@@ -29,6 +29,31 @@ def test_check_rejects_sizes_over_the_ttm_headroom(size_gib: int) -> None:
         rhm.check_offload_size(size_gib * GiB, NODE, driver_owned=True)
 
 
+@pytest.mark.parametrize(("size_gib", "fits"), [(256, True), (300, True), (320, False)])
+def test_explicit_reserve_for_large_cpu_side_tables(monkeypatch, size_gib, fits) -> None:
+    # Qwen3.8-Flash-Next keeps ~200 GiB of other driver-owned pinned memory: 320 GiB
+    # of offload passed the 25% default but left 3.6 GiB of TTM headroom.
+    monkeypatch.setenv("VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB", "190")
+    if fits:
+        rhm.check_offload_size(size_gib * GiB, NODE, driver_owned=True)
+    else:
+        with pytest.raises(ValueError, match="190 GiB for other"):
+            rhm.check_offload_size(size_gib * GiB, NODE, driver_owned=True)
+
+
+def test_runtime_headroom_warns_near_the_ttm_limit(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("HSA_USERPTR_FOR_PAGED_MEM", "0")
+    pages = int(503.6 * GiB) // rhm._PAGE_SIZE
+    monkeypatch.setattr(rhm, "_read_int", lambda path: pages)
+    for used_gib, warns in ((483, False), (500, True)):
+        monkeypatch.setattr(rhm, "driver_owned_bytes_in_use", lambda u=used_gib: u * GiB)
+        warned = []
+        monkeypatch.setattr(rhm.logger, "warning", lambda *a, **k: warned.append(a))
+        monkeypatch.setattr(rhm.logger, "info", lambda *a, **k: None)
+        rhm.check_runtime_headroom("test")
+        assert bool(warned) == warns
+
+
 def test_ttm_limit_only_applies_to_driver_owned_memory() -> None:
     rhm.check_offload_size(384 * GiB, NODE, driver_owned=False)
 

@@ -25,13 +25,20 @@ logger = init_logger(__name__)
 
 _USERPTR_ENV = "HSA_USERPTR_FOR_PAGED_MEM"
 _SKIP_CHECK_ENV = "VLLM_ROCM_OFFLOAD_SKIP_MEMORY_CHECK"
+_RESERVE_ENV = "VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB"
+_GTT_USED_GLOB = "/sys/class/drm/card*/device/mem_info_gtt_used"
 _TTM_PAGES_LIMIT = "/sys/module/ttm/parameters/pages_limit"
 _CGROUP_MEMORY_MAX = "/sys/fs/cgroup/memory.max"
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 # Share of TTM's limit left for every other driver-owned buffer (staging
-# buffers, communication buffers, model-specific host tables).
+# buffers, communication buffers, model-specific host tables) when
+# VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB does not give the reserve explicitly.
+# Models with large CPU-side tables need more: ~200 GiB on Qwen3.8-Flash-Next.
 TTM_HEADROOM_FRACTION = 0.25
+# Warn when a worker sees less driver-owned headroom than this after its
+# offload buffer is allocated.
+MIN_RUNTIME_HEADROOM_BYTES = 16 << 30
 # Most of the machine (or pod) memory a CPU KV buffer that can never be
 # swapped or reclaimed may take.
 MAX_MEMORY_FRACTION = 0.5
@@ -71,6 +78,54 @@ def read_host_memory_limits() -> HostMemoryLimits:
     )
 
 
+def _pinned_reserve_bytes(ttm_limit_bytes: int) -> int:
+    """TTM bytes kept for driver-owned buffers other than the offload."""
+    value = os.environ.get(_RESERVE_ENV)
+    if value:
+        return int(float(value) * (1 << 30))
+    return int(ttm_limit_bytes * TTM_HEADROOM_FRACTION)
+
+
+def driver_owned_bytes_in_use() -> int | None:
+    """Driver-owned (GTT) host memory in use across all amdgpu devices."""
+    import glob
+
+    total, found = 0, False
+    for path in glob.glob(_GTT_USED_GLOB):
+        value = _read_int(path)
+        if value is not None:
+            total += value
+            found = True
+    return total if found else None
+
+
+def check_runtime_headroom(worker: str) -> None:
+    """Warn if driver-owned memory is close to TTM's limit (after allocation).
+
+    Other workers may still be allocating, so this is a lower bound on the
+    final use; the start-up check is the one that refuses a size.
+    """
+    if os.environ.get(_USERPTR_ENV) != "0":
+        return
+    ttm_pages = _read_int(_TTM_PAGES_LIMIT)
+    used = driver_owned_bytes_in_use()
+    if not ttm_pages or used is None:
+        return
+    limit = ttm_pages * _PAGE_SIZE
+    gib = 1 << 30
+    headroom = limit - used
+    log = logger.warning if headroom < MIN_RUNTIME_HEADROOM_BYTES else logger.info
+    log(
+        "CPU KV offload (%s): driver-owned host memory %.1f of %.1f GiB (TTM "
+        "limit), %.1f GiB headroom%s",
+        worker,
+        used / gib,
+        limit / gib,
+        headroom / gib,
+        "; reduce --kv-offloading-size" if headroom < MIN_RUNTIME_HEADROOM_BYTES else "",
+    )
+
+
 def check_offload_size(
     offload_bytes: int, limits: HostMemoryLimits, driver_owned: bool
 ) -> None:
@@ -78,14 +133,15 @@ def check_offload_size(
     gib = 1 << 30
     problems = []
     if driver_owned and limits.ttm_limit_bytes:
-        allowed = int(limits.ttm_limit_bytes * (1 - TTM_HEADROOM_FRACTION))
+        reserve = _pinned_reserve_bytes(limits.ttm_limit_bytes)
+        allowed = limits.ttm_limit_bytes - reserve
         if offload_bytes > allowed:
             problems.append(
                 f"driver-owned pinned memory counts toward the amdgpu TTM limit of "
                 f"{limits.ttm_limit_bytes / gib:.0f} GiB shared by all GPUs; the "
                 f"offload may use at most {allowed / gib:.0f} GiB of it, leaving "
-                f"{TTM_HEADROOM_FRACTION:.0%} for other driver buffers (going over "
-                "makes the driver evict buffers and stall the GPUs)"
+                f"{reserve / gib:.0f} GiB for other driver-owned buffers ({_RESERVE_ENV}"
+                "; going over makes the driver evict buffers and stall the GPUs)"
             )
     memory = [m for m in (limits.cgroup_limit_bytes, limits.mem_total_bytes) if m]
     if memory:

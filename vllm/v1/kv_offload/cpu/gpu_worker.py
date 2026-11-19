@@ -900,6 +900,11 @@ class CPUOffloadingWorker(OffloadingWorker):
 
             cpu_tensors.append(cpu_tensor)
 
+        if pin_memory and mmap_region is None and current_platform.is_rocm():
+            from vllm.v1.kv_offload.cpu.rocm_host_memory import check_runtime_headroom
+
+            check_runtime_headroom(f"device {torch.accelerator.current_device_index()}")
+
         make_handler = functools.partial(
             SingleDirectionOffloadingHandler,
             cpu_tensors=cpu_tensors,
