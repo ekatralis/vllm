@@ -28,8 +28,9 @@
 #     vllm-mi100-qwen38 serve-qwen38 tp2pp4
 #   Extra vllm arguments can follow the recipe name. MODEL=/path overrides the model directory.
 #   tp2pp4 / tp2pp4-yarn run with prefix caching and TunableOp on (QWEN38_TUNABLEOP=0 turns TunableOp off).
-#   CPU KV offload (optional, tp2pp4 recipes): append --kv-offloading-size 384. The region lives in /dev/shm, which
-#   --ipc=host shares with the host; keep it <= 384 GiB (amdgpu driver pinned-memory cap on the MI100 node).
+#   CPU KV offload (optional, tp2pp4 recipes): append --kv-offloading-size 300 (GiB of host RAM; 256 for more margin).
+#   It must fit the amdgpu TTM limit together with ~200 GiB of other pinned memory (SERVING.md); the launcher sets
+#   VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB=190 so start-up refuses sizes that don't fit.
 
 FROM ubuntu:24.04
 
@@ -432,6 +433,8 @@ set -euo pipefail
 MODEL=${MODEL:-/models/Qwen3.8-Flash-Next-W4A16}
 RECIPE=${1:-tp2pp4}; [ $# -gt 0 ] && shift
 export VLLM_PP_DECODE_BALANCE_MIN_REQS=${VLLM_PP_DECODE_BALANCE_MIN_REQS:-2}
+# CPU KV offload: other driver-owned pinned memory on this model is ~200 GiB (SERVING.md, ERR-15).
+export VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB=${VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB:-190}
 # Prefix caching (validated for tp2pp4 and tp2pp4-yarn; tp4pp2 keeps the previously validated setting, off).
 CACHE=(--enable-prefix-caching --enable-prompt-tokens-details)
 tunableop() {  # tuned GEMM results for the TP2 x PP4 layout (per-GPU files); untuned shapes use the default kernels
