@@ -191,6 +191,16 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     return;
   }
 #elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+  // On ROCm, hipMemcpyBatchAsync copies (SDMA) issued while compute kernels
+  // run can hang the GPU (seen on MI100 / gfx908 with HIP 7.16: every queue
+  // busy, no copy or kernel completes; batches of 64 hang too). Per-copy
+  // hipMemcpyAsync on the same engines does not, so it is the default on
+  // ROCm; VLLM_ROCM_KV_OFFLOAD_BATCH_MEMCPY=1 re-enables the batch call.
+  static const bool rocm_batch = []() {
+    const char* v = std::getenv("VLLM_ROCM_KV_OFFLOAD_BATCH_MEMCPY");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (rocm_batch)
   // ROCm 7.1+ exposes hipMemcpyBatchAsync. ROCm 7.2.1-7.2.3 early-return
   // hipErrorNotSupported whenever numAttrs > 0 (see ROCm/clr @ rocm-7.2.1
   // hipamd/src/hip_memory.cpp:2819-2822), so those releases must call with
