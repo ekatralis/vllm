@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.verify import get_verifier
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
@@ -90,6 +91,7 @@ class Transfer:
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
     failed: bool = False
+    num_ops: int = 0
 
 
 def compute_sub_block_ptrs(
@@ -356,6 +358,7 @@ class SingleDirectionOffloadingHandler:
             layer_refs_per_group, gpu_to_cpu, host_memory_is_pinned
         )
         self.blocks_per_chunk = blocks_per_chunk
+        self._verifier = get_verifier()
 
         # Per (group, ref) static copy plans for the canonical layout
         self._canonical_copy_plans: list[list[CopyPlan]] | None = (
@@ -696,6 +699,7 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                num_ops=op_idx,
             )
         )
 
@@ -733,6 +737,14 @@ class SingleDirectionOffloadingHandler:
                 results.append(TransferResult(job_id=transfer.job_id, success=False))
                 continue
 
+            if self._verifier is not None:
+                n = transfer.num_ops
+                self._verifier.check(
+                    transfer.batch_src[:n],
+                    transfer.batch_dst[:n],
+                    transfer.batch_sizes[:n],
+                    self.gpu_to_cpu,
+                )
             results.append(
                 TransferResult(
                     job_id=transfer.job_id,
