@@ -31,6 +31,46 @@ def exclude_from_core_dump(mmap_obj: mmap.mmap) -> None:
         )
 
 
+def alloc_exact_pinned_tensor(
+    shape: tuple[int, ...], dtype: torch.dtype = torch.int8
+) -> torch.Tensor:
+    """A zeroed pinned host tensor of exactly the requested size.
+
+    ``torch.zeros(..., pin_memory=True)`` goes through the caching host
+    allocator, which rounds every allocation up to a power of two: a 48 GiB
+    CPU KV buffer takes 64 GiB. On ROCm this allocates with ``hipHostMalloc``
+    instead, so the buffer takes what it needs; the memory is freed when the
+    last tensor or view of it is gone. Other platforms keep the torch path.
+    """
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm() or nbytes == 0:
+        return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=True)
+
+    import ctypes
+    import weakref
+
+    from vllm.v1.simple_kv_offload.cuda_mem_ops import _load_hip_runtime
+
+    # torch reports host memory as pinned only once its own HIP context exists.
+    torch.cuda.init()
+    hip = _load_hip_runtime()
+    ptr = ctypes.c_void_p()
+    # hipHostMallocDefault: pinned, mapped into every device's address space.
+    err = hip.hipHostMalloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes), 0)
+    if err != 0 or not ptr.value:
+        raise RuntimeError(
+            f"hipHostMalloc of {nbytes / (1 << 30):.2f} GiB failed (error {err})"
+        )
+    buf = (ctypes.c_uint8 * nbytes).from_address(ptr.value)
+    weakref.finalize(buf, hip.hipHostFree, ctypes.c_void_p(ptr.value))
+    # The tensor keeps `buf` (and so the allocation) alive through every view.
+    tensor = torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(shape)
+    tensor.zero_()
+    return tensor
+
+
 def pin_tensor(tensor: torch.Tensor) -> None:
     """Register one CPU range, bypassing the caching host allocator's rounding."""
     err = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.nbytes, 0)

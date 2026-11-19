@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
+from vllm.utils.host_memory import alloc_exact_pinned_tensor
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
@@ -877,14 +878,20 @@ class CPUOffloadingWorker(OffloadingWorker):
                 cpu_tensor = mmap_region.create_next_worker_view(cpu_page_size_bytes)
             else:
                 t0 = time.monotonic()
-                cpu_tensor = torch.zeros(
-                    (num_cpu_chunks, cpu_page_size_bytes),
-                    dtype=torch.int8,
-                    device="cpu",
-                    pin_memory=pin_memory,
-                )
+                if pin_memory:
+                    # Exact size: the caching host allocator would round each
+                    # buffer up to a power of two (48 GiB -> 64 GiB).
+                    cpu_tensor = alloc_exact_pinned_tensor(
+                        (num_cpu_chunks, cpu_page_size_bytes), dtype=torch.int8
+                    )
+                else:
+                    cpu_tensor = torch.zeros(
+                        (num_cpu_chunks, cpu_page_size_bytes),
+                        dtype=torch.int8,
+                        device="cpu",
+                    )
                 logger.debug(
-                    "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
+                    "CPU KV tensor %d×%d (%.2f GB): %.3f s",
                     num_cpu_chunks,
                     cpu_page_size_bytes,
                     num_cpu_chunks * cpu_page_size_bytes / 1e9,

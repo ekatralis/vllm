@@ -1281,6 +1281,15 @@ class VllmConfig:
             self.kv_transfer_config.kv_connector_extra_config.update(
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
             )
+            if config_connector == "OffloadingConnector":
+                from vllm.platforms import current_platform
+
+                if current_platform.is_rocm():
+                    from vllm.v1.kv_offload.cpu.rocm_host_memory import (
+                        configure_rocm_cpu_offload,
+                    )
+
+                    configure_rocm_cpu_offload(int(kv_offloading_size * (1 << 30)))
         elif kv_offloading_backend == "lmcache":
             # Default to LMCache multi-process (MP) mode. The actual KV
             # storage capacity is managed by the standalone LMCache server
