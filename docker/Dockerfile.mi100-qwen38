@@ -28,7 +28,7 @@
 #     vllm-mi100-qwen38 serve-qwen38 tp2pp4
 #   Extra vllm arguments can follow the recipe name. MODEL=/path overrides the model directory.
 #   tp2pp4 / tp2pp4-yarn run with prefix caching and TunableOp on (QWEN38_TUNABLEOP=0 turns TunableOp off).
-#   CPU KV offload (optional, tp2pp4 recipes): append --kv-offloading-size 300 (GiB of host RAM; 256 for more margin).
+#   CPU KV offload (optional, tp2pp4 recipes): append --kv-offloading-size 300 for tp2pp4, 280 for tp2pp4-yarn (GiB of host RAM; the 1M recipe pins ~7.5 GiB more).
 #   It must fit the amdgpu TTM limit together with ~200 GiB of other pinned memory (SERVING.md); the launcher sets
 #   VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB=190 so start-up refuses sizes that don't fit.
 
