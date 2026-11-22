@@ -8,7 +8,8 @@
 #   * PyTorch / torchvision / Triton / ROCm SDK as TheRock multi-arch wheels for gfx908, pinned to the exact
 #     builds used here. torch pins triton==3.8.0+git3f6e4113.rocm10.1.0a20260822 itself.
 #   * vLLM from the fork, branch mi100-qwen38 (gfx908 kernels, PP fixes, ERR-1/2/3/9/14 fixes, MI100-tuned W4A16 MoE
-#     configs), editable install.
+#     configs, CPU KV offload fixes ERR-15/16: driver-owned exact-size pinned buffers, per-copy offload memcpy on ROCm),
+#     editable install. Evaluated release: tag mi100-qwen38-v1.0 (EVALUATION.md verdict 2026-11-22).
 #   * PyTorch TunableOp results for the dense GEMMs (docker/tunableop-mi100-qwen38-tp2pp4/ in the fork; valid only for
 #     the pinned torch/HIP/hipBLASLt/rocBLAS builds below), used by the tp2pp4 recipes: +5-7% prefill.
 #   * vLLM's Rust frontend (vllm-rs) built too; it is only used with VLLM_USE_RUST_FRONTEND=1 (off by default).
@@ -20,7 +21,8 @@
 #   docker build -f Dockerfile.mi100-qwen38 -t vllm-mi100-qwen38 .            # no build context files needed
 #   docker build --build-arg VLLM_REF=<commit> --build-arg MAX_JOBS=64 ...    # pin another commit / more cores
 #
-# Run (recipe names: tp2pp4 (default, recommended), tp2pp4-yarn (1M context), tp4pp2 (lowest latency, 1-4 users)):
+# Run (recipe names: tp2pp4 (default, recommended), tp2pp4-yarn (1M context), tp4pp2 (comparison only: tp2pp4 is as fast
+# or faster at every user count since TunableOp, 2026-11-22)):
 #   docker run --rm -it --network=host --ipc=host --shm-size=64g \
 #     --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
 #     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -31,6 +33,9 @@
 #   CPU KV offload (optional, tp2pp4 recipes): append --kv-offloading-size 300 for tp2pp4, 280 for tp2pp4-yarn (GiB of host RAM; the 1M recipe pins ~7.5 GiB more).
 #   It must fit the amdgpu TTM limit together with ~200 GiB of other pinned memory (SERVING.md); the launcher sets
 #   VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB=190 so start-up refuses sizes that don't fit.
+#   Image input (optional, tested on tp2pp4 and tp2pp4-yarn): QWEN38_IMAGES=1 (docker run -e) allows up to 4 images per
+#   prompt and uses Triton ViT attention (PyTorch SDPA runs out of memory profiling the 16 MP maximum image, ERR-17).
+#   Costs ~3% of the GPU KV cache; the vision encoder is slow on MI100. Video stays off.
 
 FROM ubuntu:24.04
 
@@ -415,6 +420,8 @@ assert (root / "models/qwen4_exp/amd/model.py").is_file(), "Qwen4Exp AMD port mi
 moe_cfg = root / "model_executor/layers/fused_moe/configs/E=256,N=640,device_name=AMD_Instinct_MI100,dtype=int4_w4a16.json"
 assert "waves_per_eu" in moe_cfg.read_text(), "MI100 W4A16 MoE config (dea112bfdd) missing"
 assert "max_worker_kv_bytes_per_block" in (root / "v1/kv_cache_interface.py").read_text(), "ERR-14 offload fix missing"
+assert "check_runtime_headroom" in (root / "v1/kv_offload/cpu/rocm_host_memory.py").read_text(), "ERR-15 offload fix missing"
+assert "VLLM_ROCM_KV_OFFLOAD_BATCH_MEMCPY" in (root.parent / "csrc/cache_kernels.cu").read_text(), "ERR-16 offload fix missing"
 tun = sorted((root.parent / "docker/tunableop-mi100-qwen38-tp2pp4").glob("tunableop_results*.csv"))
 assert len(tun) == 8, f"TunableOp results missing ({len(tun)} files)"
 torch_ver = m.version("torch").split("a0")[0].split("+")[0]
@@ -435,6 +442,9 @@ RECIPE=${1:-tp2pp4}; [ $# -gt 0 ] && shift
 export VLLM_PP_DECODE_BALANCE_MIN_REQS=${VLLM_PP_DECODE_BALANCE_MIN_REQS:-2}
 # CPU KV offload: other driver-owned pinned memory on this model is ~200 GiB (SERVING.md, ERR-15).
 export VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB=${VLLM_ROCM_OFFLOAD_PINNED_RESERVE_GIB:-190}
+# Image input (ERR-17: the default SDPA ViT attention runs out of memory on MI100; Triton attention does not).
+MM=(--limit-mm-per-prompt '{"image":0,"video":0}')
+[ "${QWEN38_IMAGES:-0}" = 1 ] && MM=(--limit-mm-per-prompt '{"image":4,"video":0}' --mm-encoder-attn-backend TRITON_ATTN)
 # Prefix caching (validated for tp2pp4 and tp2pp4-yarn; tp4pp2 keeps the previously validated setting, off).
 CACHE=(--enable-prefix-caching --enable-prompt-tokens-details)
 tunableop() {  # tuned GEMM results for the TP2 x PP4 layout (per-GPU files); untuned shapes use the default kernels
@@ -455,7 +465,7 @@ case "$RECIPE" in
   *) echo "unknown recipe '$RECIPE' (tp2pp4 | tp2pp4-yarn | tp4pp2)" >&2; exit 2 ;;
 esac
 exec vllm serve "$MODEL" --served-model-name qwen38-w4 "${ARGS[@]}" --enable-expert-parallel \
-  --limit-mm-per-prompt '{"image":0,"video":0}' --max-num-seqs 64 --gpu-memory-utilization 0.94 \
+  "${MM[@]}" --max-num-seqs 64 --gpu-memory-utilization 0.94 \
   "${CACHE[@]}" --speculative-config "$SPEC" \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice \
   --trust-remote-code --host 0.0.0.0 --port 8000 "$@"
