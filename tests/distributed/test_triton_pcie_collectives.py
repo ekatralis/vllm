@@ -98,8 +98,10 @@ def test_mailbox_seq_crosses_wraps(n):
             torch.testing.assert_close(out, inp, rtol=0, atol=0)
 
 
+# 2 ranks: the one-shot path used by TP2 serving; 4 ranks also takes two-shot.
+@pytest.mark.parametrize("nproc", [2, 4])
 @multi_gpu_test(num_gpus=4)
-def test_pcie_protocol_across_48bit_wrap():
+def test_pcie_protocol_across_48bit_wrap(nproc):
     # Rendezvous on localhost explicitly: --standalone resolves the hostname,
     # which some containers cannot.
     with socket.socket() as sock:
@@ -113,7 +115,7 @@ def test_pcie_protocol_across_48bit_wrap():
             "--nnodes=1",
             "--master-addr=127.0.0.1",
             f"--master-port={port}",
-            "--nproc-per-node=4",
+            f"--nproc-per-node={nproc}",
             "--module",
             "tests.distributed.test_triton_pcie_collectives",
         ],
@@ -123,7 +125,7 @@ def test_pcie_protocol_across_48bit_wrap():
 
 
 def _run_worker():
-    """4 ranks: random-size all-reduces (one-shot and two-shot), all-gathers,
+    """2 or 4 ranks: random-size all-reduces (one-shot; two-shot from 3 ranks), all-gathers,
     CUDA-graph replays and mailbox messages, all crossing the tag wrap."""
     rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", rank)
