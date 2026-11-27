@@ -9,7 +9,8 @@
 #     builds used here. torch pins triton==3.8.0+git3f6e4113.rocm10.1.0a20260822 itself.
 #   * vLLM from the fork, branch mi100-qwen38 (gfx908 kernels, PP fixes, ERR-1/2/3/9/14 fixes, MI100-tuned W4A16 MoE
 #     configs, CPU KV offload fixes ERR-15/16: driver-owned exact-size pinned buffers, per-copy offload memcpy on ROCm),
-#     editable install. Evaluated release: tag mi100-qwen38-v1.0 (EVALUATION.md verdict 2026-11-22).
+#     editable install. Evaluated release: tag mi100-qwen38-v1.0 (EVALUATION.md verdict 2026-11-22); v1.0.1 adds
+#     review fixes (offload copy-error check, skinny-GEMM size guard, PCIe collectives off under DBO), re-validated.
 #   * PyTorch TunableOp results for the dense GEMMs (docker/tunableop-mi100-qwen38-tp2pp4/ in the fork; valid only for
 #     the pinned torch/HIP/hipBLASLt/rocBLAS builds below), used by the tp2pp4 recipes: +5-7% prefill.
 #   * vLLM's Rust frontend (vllm-rs) built too; it is only used with VLLM_USE_RUST_FRONTEND=1 (off by default).
