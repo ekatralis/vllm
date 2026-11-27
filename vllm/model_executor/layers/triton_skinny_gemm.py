@@ -195,6 +195,9 @@ def _skinny_dot_kernel(
 # after another, but the shared experts run on a second stream at the same
 # time. Zero between kernels: the last split of a tile resets its counter, so
 # a CUDA graph can replay the kernels.
+# Assumes the kernels on one stream run one at a time: graphs captured on the
+# same capture stream share one counter tensor, so they must not replay
+# concurrently (fine today; revisit for dual-batch overlap or side streams).
 _COUNTERS: dict[tuple[torch.device, int], torch.Tensor] = {}
 _MAX_SPLIT_TILES = 4096
 

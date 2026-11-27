@@ -497,6 +497,7 @@ def _use_triton_skinny_gemm(x: torch.Tensor, weight: torch.Tensor, n: int) -> bo
         and weight.dtype == x.dtype
         and weight.dim() == 2
         and weight.stride(1) == 1
+        and weight.numel() < 1 << 31  # the kernel's weight offsets are int32
     )
 
 
