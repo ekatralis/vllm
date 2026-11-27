@@ -231,9 +231,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
+        # PcieCollectives assume one stream (see triton_pcie_collectives.py);
+        # micro-batching (DBO) overlaps collectives on two streams.
+        ubatching = config is not None and config.parallel_config.use_ubatching
+        if ubatching and _use_pcie_collectives(self.device, self.world_size):
+            logger.warning_once(
+                "Micro-batching is enabled: PCIe collectives are disabled "
+                "(single-stream only); using RCCL."
+            )
         if (
             self.world_size > 1
             and unique_name.split(":")[0] == "tp"
+            and not ubatching
             and _use_pcie_collectives(self.device, self.world_size)
         ):
             # PCIe-only MI100: RCCL takes ~0.3 ms per small collective.

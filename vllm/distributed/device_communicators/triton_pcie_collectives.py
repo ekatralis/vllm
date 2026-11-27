@@ -281,6 +281,10 @@ class PcieCollectives:
             self._buf_ptr_t = torch.tensor(
                 self._buf_ptrs, dtype=torch.int64, device=device
             )
+            # One epoch counter and buffer set per communicator: collectives
+            # must not run concurrently on two streams (they would share tags
+            # and buffer halves). cuda_communicator.py keeps these off when
+            # micro-batching (DBO) is enabled.
             self._epoch = torch.zeros(_NUM_PROGRAMS, dtype=torch.int64, device=device)
 
     def should_use(self, inp: torch.Tensor, max_bytes: int | None = None) -> bool:
