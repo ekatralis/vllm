@@ -248,10 +248,13 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     // individual async copies. cudaMemcpyDefault lets the driver infer
     // direction from pointer types.
     for (int64_t i = 0; i < n; i++) {
-      cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
-                      reinterpret_cast<void*>(src_data[i]),
-                      static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
-                      stream);
+      cudaError_t err = cudaMemcpyAsync(
+          reinterpret_cast<void*>(dst_data[i]),
+          reinterpret_cast<void*>(src_data[i]),
+          static_cast<size_t>(size_data[i]), cudaMemcpyDefault, stream);
+      // A failed enqueue must not be reported as a finished transfer.
+      STD_TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed for copy ", i,
+                      " of ", n, ": ", cudaGetErrorString(err));
     }
   }
 }
