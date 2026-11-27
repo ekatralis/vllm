@@ -7,8 +7,8 @@
 #   * ROCm 10.3 TheRock tarball in /opt/rocm: compiler and headers for building vLLM's HIP extensions, amd-smi.
 #   * PyTorch / torchvision / Triton / ROCm SDK as TheRock multi-arch wheels for gfx908, pinned to the exact
 #     builds used here. torch pins triton==3.8.0+git3f6e4113.rocm10.1.0a20260822 itself.
-#   * vLLM from the fork, branch mi100-qwen38 (gfx908 kernels, PP fixes, ERR-1/2/3/9/14 fixes, MI100-tuned W4A16 MoE
-#     configs, CPU KV offload fixes ERR-15/16: driver-owned exact-size pinned buffers, per-copy offload memcpy on ROCm),
+#   * vLLM from the fork, release tag mi100-qwen38-v1.0.1 on branch mi100-qwen38 (gfx908 kernels, PP fixes,
+#     ERR-1/2/3/9/14 fixes, MI100-tuned W4A16 MoE configs, CPU KV offload fixes ERR-15/16: driver-owned exact-size pinned buffers, per-copy offload memcpy on ROCm),
 #     editable install. Evaluated release: tag mi100-qwen38-v1.0 (EVALUATION.md verdict 2026-11-22); v1.0.1 adds
 #     review fixes (offload copy-error check, skinny-GEMM size guard, PCIe collectives off under DBO), re-validated.
 #   * PyTorch TunableOp results for the dense GEMMs (docker/tunableop-mi100-qwen38-tp2pp4/ in the fork; valid only for
@@ -20,7 +20,7 @@
 #
 # Build (needs network; ~1-2 h, most of it the HIP extensions):
 #   docker build -f Dockerfile.mi100-qwen38 -t vllm-mi100-qwen38 .            # no build context files needed
-#   docker build --build-arg VLLM_REF=<commit> --build-arg MAX_JOBS=64 ...    # pin another commit / more cores
+#   docker build --build-arg VLLM_REF=<tag|commit> --build-arg MAX_JOBS=64 ...  # another ref (default: release tag) / more cores
 #
 # Run (recipe names: tp2pp4 (default, recommended), tp2pp4-yarn (1M context), tp4pp2 (comparison only: tp2pp4 is as fast
 # or faster at every user count since TunableOp, 2026-11-22)):
@@ -55,9 +55,10 @@ ARG TORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
 ARG TORCH_VERSION=2.15.0a0+rocm10.1.0a20260822
 ARG TORCHVISION_VERSION=0.30.0a0+rocm10.1.0a20260822
 ARG ROCM_WHEELS_VERSION=10.1.0a20260822
-# vLLM source: our fork. VLLM_REF can be a branch, tag or commit (pin a commit for reproducible images).
+# vLLM source: our fork, pinned to the evaluated release tag. VLLM_REF can be any branch, tag or commit
+# (e.g. mi100-qwen38 for the branch head, which is not necessarily validated).
 ARG VLLM_REPO=https://github.com/ekatralis/vllm.git
-ARG VLLM_REF=mi100-qwen38
+ARG VLLM_REF=mi100-qwen38-v1.0.1
 # 1 = build the Rust frontend (vllm-rs) and fail the build if it does not compile; 0 = skip it.
 ARG BUILD_RUST_FRONTEND=1
 # Parallel compile jobs for the HIP extensions (each takes several GB of RAM).
